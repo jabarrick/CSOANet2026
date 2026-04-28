@@ -1,0 +1,133 @@
+===========================================================
+  CSOANet2026 — 20 BCI Task Presets (Copy-Paste Ready)
+===========================================================
+
+HOW TO USE:
+  1. Find the preset matching your task below.
+  2. Copy the single TASK = ... line.
+  3. Paste it to replace the TASK line in csoanet2026.py.
+  4. Done. The model auto-adapts to your data.
+
+FORMAT:
+  TASK = auto_cfg(channels, timepoints, n_classes)
+
+===========================================================
+  MOTOR IMAGERY
+===========================================================
+
+# 1. BCI Competition IV-2a (Brunner et al.)
+#    22 channels, 250 Hz, 4s trial, 4 classes (left/right/foot/tongue)
+TASK = auto_cfg(22, 1000, 4)
+
+# 2. BCI Competition IV-2b (Leeb et al.)
+#    3 channels (C3/Cz/C4), 250 Hz, 4s trial, 2 classes
+TASK = auto_cfg(3, 1000, 2)
+
+# 3. PhysioNet Motor Imagery (Schalk et al.)
+#    64 channels, 160 Hz, 4s trial, 4 classes
+TASK = auto_cfg(64, 640, 4)
+
+# 4. OpenBMI (Lee et al. 2019)
+#    62 channels, 1000 Hz, 4s trial, 2 classes (left/right hand)
+TASK = auto_cfg(62, 4000, 2)
+
+# 5. High-Gamma Dataset (Schirrmeister et al.)
+#    128 channels, 500 Hz, 4s trial, 4 classes
+TASK = auto_cfg(128, 2000, 4)
+
+===========================================================
+  VISUAL PERCEPTION / IMAGERY
+===========================================================
+
+# 6. PerceiveImagine ds005697 (Xie et al.) *** DEFAULT ***
+#    62 channels, 1000 Hz, 2s epoch (-1 to +1), 2 classes
+TASK = auto_cfg(62, 2000, 2)
+
+# 7. PerceiveImagine — extended window (-0.5 to +3.0s)
+#    62 channels, 1000 Hz, 3.5s epoch, 2 classes
+TASK = auto_cfg(62, 3500, 2)
+
+# 8. THINGS-EEG (Gifford et al. 2022)
+#    64 channels, 1000 Hz, 1s epoch, multi-class (use top-N)
+TASK = auto_cfg(64, 1000, 10)
+
+===========================================================
+  EVENT-RELATED POTENTIALS (ERP)
+===========================================================
+
+# 9. P300 Speller (BCI Competition III-2)
+#    64 channels, 240 Hz, 1s epoch, 2 classes (target/non-target)
+TASK = auto_cfg(64, 240, 2)
+
+# 10. P300 Speller — high-density
+#     128 channels, 256 Hz, 0.8s epoch, 2 classes
+TASK = auto_cfg(128, 205, 2)
+
+# 11. Auditory Oddball P300
+#     32 channels, 500 Hz, 1s epoch, 2 classes
+TASK = auto_cfg(32, 500, 2)
+
+===========================================================
+  SSVEP (STEADY-STATE VISUAL EVOKED POTENTIAL)
+===========================================================
+
+# 12. Benchmark SSVEP (Wang et al. 2017)
+#     9 channels (occipital), 250 Hz, 4s trial, 40 classes
+TASK = auto_cfg(9, 1000, 40)
+
+# 13. BETA SSVEP (Liu et al. 2020)
+#     64 channels, 250 Hz, 2s trial, 40 classes
+TASK = auto_cfg(64, 500, 40)
+
+===========================================================
+  EMOTION RECOGNITION
+===========================================================
+
+# 14. DEAP Dataset (Koelstra et al. 2012)
+#     32 channels, 128 Hz, 60s segment → 4s windows, 2 classes (valence)
+TASK = auto_cfg(32, 512, 2)
+
+# 15. SEED Dataset (Zheng & Lu 2015)
+#     62 channels, 200 Hz, 1s segment, 3 classes (pos/neu/neg)
+TASK = auto_cfg(62, 200, 3)
+
+# 16. SEED-V (Liu et al. 2021)
+#     62 channels, 200 Hz, 1s segment, 5 classes
+TASK = auto_cfg(62, 200, 5)
+
+===========================================================
+  SLEEP STAGING
+===========================================================
+
+# 17. Sleep-EDF (Kemp et al.)
+#     2 channels (Fpz-Cz, Pz-Oz), 100 Hz, 30s epoch, 5 classes
+TASK = auto_cfg(2, 3000, 5)
+
+# 18. MASS Dataset (O'Reilly et al.)
+#     20 channels, 256 Hz, 30s epoch, 5 classes
+TASK = auto_cfg(20, 7680, 5)
+
+===========================================================
+  SEIZURE DETECTION
+===========================================================
+
+# 19. CHB-MIT Seizure (Shoeb 2009)
+#     23 channels, 256 Hz, 4s window, 2 classes (seizure/normal)
+TASK = auto_cfg(23, 1024, 2)
+
+# 20. TUH Abnormal EEG (Lopez 2017)
+#     21 channels, 250 Hz, 10s window, 2 classes (normal/abnormal)
+TASK = auto_cfg(21, 2500, 2)
+
+===========================================================
+  NOTES
+===========================================================
+
+- All presets use auto_cfg() which computes optimal F1, D, dropout,
+  kernel sizes, dilation rates, and pool factors automatically.
+- For custom tasks not listed above, simply call:
+    TASK = auto_cfg(your_channels, your_timepoints, your_n_classes)
+- The model adapts to ANY channel count (1–256), ANY sampling
+  rate / epoch length, and ANY number of classes (2–40+).
+- For tasks with > 12 classes, the model auto-scales to F1=32, D=4
+  for additional capacity.

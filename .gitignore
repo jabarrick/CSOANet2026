@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project data (large, regenerable from raw)
+eeg_project/data/raw/
+eeg_project/data/processed/*.fif
+eeg_project/data/time_cache/*.pt
+eeg_project/figures/*.png
+
+# Model checkpoints
+*.pt
+*.pth
+best_model.pt
+
+# Cache
+D:/CxAlign_cache/
+*.npy
+*.npz
+
+# CSV results are KEPT (not ignored) for reproducibility:
+# eeg_project/results/*.csv  ← intentionally NOT in this list

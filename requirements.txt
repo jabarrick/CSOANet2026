@@ -1,0 +1,8 @@
+# CSOANet2026 — tested on Python 3.9, CUDA 12.1
+torch>=2.0.0
+numpy>=1.26.0
+pandas>=2.0.0
+scikit-learn>=1.6.0
+mne>=1.8.0
+matplotlib>=3.9.0
+seaborn>=0.13.0
