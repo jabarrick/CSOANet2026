@@ -1005,7 +1005,7 @@ def fig7_gradcam_tfr(subjects):
     save_fig(fig, 'Fig5_gradcam_comparison'); plt.close(fig)
 
 
-def figS13_training_curves(subjects):
+def figS11_training_curves(subjects):
     N = len(subjects)
     for k, sid in enumerate(subjects):
         print(f"      [{k+1}/{N}] Sub-{sid} full training (50 epochs)...")
@@ -1027,8 +1027,8 @@ def figS13_training_curves(subjects):
         save_fig(fig, f'FigS11_training_curves_sub{sid}'); plt.close(fig)
 
 
-def figS14_interpretability(subjects):
-    """Fig. S13 — TFR-style interpretability: input TFR + Grad-CAM heatmap + saliency heatmap."""
+def figS12_interpretability(subjects):
+    """Fig. S12 — TFR-style interpretability: input TFR + Grad-CAM heatmap + saliency heatmap."""
     from mne.time_frequency import tfr_morlet
     import mne; mne.set_log_level("ERROR")
 
@@ -1109,7 +1109,7 @@ def figS14_interpretability(subjects):
         axes[2].set_title(f'Sub-{sid}: Pixel saliency', fontsize=11)
         plt.colorbar(im2, ax=axes[2], label='Sensitivity')
 
-        plt.suptitle(f'Fig. S13. Interpretability (Sub-{sid})', fontsize=12, y=1.02)
+        plt.suptitle(f'Fig. S12. Interpretability (Sub-{sid})', fontsize=12, y=1.02)
         plt.tight_layout()
         save_fig(fig, f'FigS12_interpretability_sub{sid}'); plt.close(fig)
 
@@ -1158,8 +1158,8 @@ def run_group_panels(subjects):
 def run_group_interpret(subjects, figs=None):
     figs = figs if figs else ['5','S11','S12']
     if '5'   in figs: print("\n  Fig. 5...");   fig7_gradcam_tfr(subjects)
-    if 'S11' in figs: print("\n  Fig. S11..."); figS13_training_curves(subjects)
-    if 'S12' in figs: print("\n  Fig. S12..."); figS14_interpretability(subjects)
+    if 'S11' in figs: print("\n  Fig. S11..."); figS11_training_curves(subjects)
+    if 'S12' in figs: print("\n  Fig. S12..."); figS12_interpretability(subjects)
 
 
 def main():
