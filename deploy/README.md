@@ -38,6 +38,7 @@ models share all temporal hyper-parameters.
 | Input | Model | Params | MACs | Peak RAM (int8) | Peak RAM, streaming input |
 |-------|-------|-------:|-----:|----------------:|--------------------------:|
 | 64 x 640, 4 classes (PhysioNet-MI) | EEGNet-8,2 | 3,572 | 27.29 M | 360 KB | 330 KB |
+| | EEGNet-8,2, spatial-first | 4,212 | 1.58 M | 50 KB | 20 KB |
 | | v1 | 3,918 | 5.05 M | 640 KB | 640 KB |
 | | v2 | 4,068 | 1.58 M | 60 KB | 30 KB |
 | 64 x 640, 2 classes | EEGNet-8,2 | 2,930 | 27.29 M | 360 KB | 330 KB |
@@ -56,10 +57,12 @@ How to read these numbers:
   separate op with its own output tensor, which accounts for half of v1's peak.
   A hand-written in-place ELU would bring v1 to about half the figure shown.
 - EEGNet is profiled as published: temporal conv on the raw channels, then spatial
-  conv. Only BatchNorm separates the two, so the spatial-first reordering of change 1
-  could be applied to EEGNet without changing its output. The table compares
-  architectures as written, not the best possible implementation of each. At 160 Hz
-  its kernels follow the paper's rule (fs/2 and fs/8 samples: 81 and 21).
+  conv. At 160 Hz its kernels follow the paper's rule (fs/2 and fs/8 samples: 81 and 21).
+- "EEGNet, spatial-first" is the same trained network with change 1 applied to it
+  (`baselines.EEGNetSpatialFirst`). Only BatchNorm separates EEGNet's temporal and
+  spatial convs, so they commute and the rewrite is exact: outputs agree to float
+  rounding, no retraining. It costs about what v2 costs. Any accuracy comparison
+  between v2 and EEGNet has to be read against this row, not the one above it.
 - "Streaming input" excludes the raw input window. It applies when the spatial
   projection is computed per sample at acquisition time.
 
@@ -78,7 +81,12 @@ pip install -r deploy/requirements.txt
 python deploy/test_v2.py
 python deploy/train_physionet_mi.py                                              # EEGNet, v1, v2
 python deploy/train_physionet_mi.py --variants v2-dynamic v2-unbounded v2-elu    # add the ablations
+python deploy/train_physionet_mi.py --variants eegnet-sf                         # reorder the trained EEGNet
 ```
+
+`eegnet-sf` does not train: it rewrites each fold's trained EEGNet spatial-first and
+measures it in float32 and int8. `v2-longkt` uses a 0.5 s temporal kernel;
+`v2-longkt-relaxed` also trains with EEGNet's weight constraints.
 
 Runs are resumable. Every finished (variant, fold) is saved, and a later call with the
 same settings skips it, so variants can be added one at a time and an interrupted run

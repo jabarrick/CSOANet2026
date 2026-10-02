@@ -49,12 +49,28 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deploy.baselines import eegnet_max_norm, make_eegnet  # noqa: E402
+from deploy.baselines import EEGNetSpatialFirst, eegnet_max_norm, make_eegnet  # noqa: E402
 from deploy.profile_model import profile_model  # noqa: E402
 from deploy.quantize import int8_report  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
 from eeg_project.scripts.models.eegnet import EEGNet  # noqa: E402
+
+def _spatial_first(model):
+    """Export this EEGNet with the spatial conv first (EEGNetSpatialFirst): identical outputs, far
+    fewer MACs.  Training is untouched; if the fold's trained `eegnet` file exists it is reused."""
+    model.export_spatial_first = True
+    return model
+
+
+def deploy_form(model):
+    """The graph that is exported, quantized and profiled for a trained model."""
+    if hasattr(model, "fuse"):
+        return model.fuse()
+    if getattr(model, "export_spatial_first", False):
+        return EEGNetSpatialFirst.from_module(model)
+    return model
+
 
 def _relaxed(model):
     """Train with EEGNet's weight constraints (max-norm 1 on the spatial filters, 0.25 on the
@@ -67,6 +83,7 @@ BAD_SUBJECTS = (88, 92, 100, 104)   # wrong sampling rate or irregular trial tim
 SFREQ = 160.0
 VARIANTS = {
     "eegnet": lambda ch, t, nc: make_eegnet(ch, t, nc, fs=SFREQ),
+    "eegnet-sf": lambda ch, t, nc: _spatial_first(make_eegnet(ch, t, nc, fs=SFREQ)),   # same net, reordered for export
     "v1": lambda ch, t, nc: CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
     "v2": lambda ch, t, nc: CSOANetV2(ch, t, nc),
     "v2-dynamic": lambda ch, t, nc: CSOANetV2(ch, t, nc, gate="dynamic"),      # v1's per-trial gate
@@ -299,11 +316,16 @@ def main():
                 print(f"  fold {fold + 1}/{a.folds} {v:<13} already done, skipped")
                 continue
             t0 = time.time()
-            torch.manual_seed(a.seed * 1000 + fold)
-            model = VARIANTS[v](ch, t, nc).to(dev)
-            val_acc, n_ep, train_acc = train(model, Xn[tr], Y[tr], Xn[va], Y[va], nc, a, dev)
-            model = model.cpu().eval()
-            export = model.fuse() if hasattr(model, "fuse") else model
+            trained_eegnet = out / "onnx" / f"{tag}_eegnet_fold{fold}_fp32.onnx"
+            if v == "eegnet-sf" and trained_eegnet.exists():        # reorder the already trained EEGNet
+                export = EEGNetSpatialFirst.from_onnx(trained_eegnet)
+                val_acc = train_acc = float("nan")
+                n_ep = 0
+            else:
+                torch.manual_seed(a.seed * 1000 + fold)
+                model = VARIANTS[v](ch, t, nc).to(dev)
+                val_acc, n_ep, train_acc = train(model, Xn[tr], Y[tr], Xn[va], Y[va], nc, a, dev)
+                export = deploy_form(model.cpu().eval())
             fp, q, _ = int8_report(export, calib, Xn[te].numpy(), out / "onnx", f"{tag}_{v}_fold{fold}", a.calib)
             p_fp, p_q, yt, gt = fp.argmax(1), q.argmax(1), y[te], g[te]
             for s in te_s:
@@ -314,7 +336,8 @@ def main():
                                  int8_agreement=float((p_fp[k] == p_q[k]).mean()),
                                  train_acc=train_acc, val_acc=val_acc, epochs=n_ep))
             print(f"  fold {fold + 1}/{a.folds} {v:<13} train {train_acc:.3f} val {val_acc:.3f} | test fp32 {(p_fp == yt).mean():.3f}"
-                  f" int8 {(p_q == yt).mean():.3f} | {n_ep} epochs, {time.time() - t0:.0f}s")
+                  f" int8 {(p_q == yt).mean():.3f} | "
+                  + (f"{n_ep} epochs" if n_ep else "reordered from the trained eegnet") + f", {time.time() - t0:.0f}s")
             pd.DataFrame(rows).to_csv(csv, index=False)
 
     df = pd.DataFrame(rows)
@@ -323,8 +346,7 @@ def main():
     df = df.sort_values(["variant", "fold", "subject"])
     profiles = {}
     for v in order:
-        m = VARIANTS[v](ch, t, nc)
-        profiles[v] = profile_model(m.fuse() if hasattr(m, "fuse") else m, torch.randn(1, 1, ch, t))
+        profiles[v] = profile_model(deploy_form(VARIANTS[v](ch, t, nc)), torch.randn(1, 1, ch, t))
     summ = df.groupby("variant", observed=True).agg(
         subjects=("subject", "nunique"), acc_fp32=("acc_fp32", "mean"), sd_fp32=("acc_fp32", "std"),
         acc_int8=("acc_int8", "mean"), sd_int8=("acc_int8", "std"), int8_agreement=("int8_agreement", "mean"))

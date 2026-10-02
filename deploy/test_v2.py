@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deploy.baselines import eegnet_max_norm, make_eegnet  # noqa: E402
+from deploy.baselines import EEGNetSpatialFirst, eegnet_max_norm, make_eegnet  # noqa: E402
 from deploy.profile_model import profile_model  # noqa: E402
 from deploy.quantize import export_fp32, float_ops, quantize_int8, run_onnx  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
@@ -118,6 +118,22 @@ def test_eegnet_baseline():
         q = quantize_int8(fp, X[:32].numpy(), Path(d) / "eq.onnx")
         assert run_onnx(q, X[32:].numpy()).shape == (16, nc)
     assert profile_model(m, X[:1])["macs"] > profile_model(CSOANetV2(ch, t, nc).fuse(), X[:1])["macs"]
+
+
+@torch.no_grad()
+def test_eegnet_spatial_first_is_exact():
+    for ch, t, nc, fs in [(64, 640, 4, 160.0), (22, 1000, 4, 250.0), (62, 2000, 2, None)]:
+        m = randomise(make_eegnet(ch, t, nc, fs))
+        x = torch.randn(4, 1, ch, t)
+        ref = m(x)
+        sf = EEGNetSpatialFirst.from_module(m)
+        assert torch.allclose(ref, sf(x), atol=1e-4, rtol=1e-4), (ch, t, float((ref - sf(x)).abs().max()))
+        with tempfile.TemporaryDirectory() as d:      # the same rewrite, starting from the exported file
+            sf2 = EEGNetSpatialFirst.from_onnx(export_fp32(m, x[:1], Path(d) / "e.onnx"))
+        assert torch.allclose(ref, sf2(x), atol=1e-4, rtol=1e-4), (ch, t, float((ref - sf2(x)).abs().max()))
+    m = make_eegnet(64, 640, 4, 160.0)
+    x = torch.randn(1, 1, 64, 640)
+    assert profile_model(EEGNetSpatialFirst.from_module(m), x)["macs"] < profile_model(m, x)["macs"] / 10
 
 
 def test_cheaper_than_v1():
