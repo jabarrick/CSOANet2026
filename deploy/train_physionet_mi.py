@@ -6,10 +6,20 @@ quantize to int8 (calibrated on training trials) and test again.  The question
 the output answers: what does each deployment change cost in accuracy, and how
 much accuracy survives int8.
 
-    python deploy/train_physionet_mi.py                           # v1 vs v2, 4-class, 5 folds
+    python deploy/train_physionet_mi.py                           # EEGNet, v1, v2; 4-class, 5 folds
     python deploy/train_physionet_mi.py --task lr                 # left vs right hand imagery
-    python deploy/train_physionet_mi.py --variants v1 v2 v2-dynamic v2-unbounded v2-elu
+    python deploy/train_physionet_mi.py --variants v2-dynamic v2-unbounded v2-elu   # add ablations
     python deploy/train_physionet_mi.py --synthetic --epochs 5    # smoke test, no download
+
+Runs are resumable: each finished (variant, fold) is written to the per-subject
+CSV, and a later call with the same settings skips what is already there.  So
+variants can be added one at a time, and an interrupted run continues where it
+stopped.  --fresh discards earlier rows.
+
+All variants share the data, split, augmentation, optimiser, schedule and early
+stopping.  Weight constraints are each model's own: max-norm 0.25 on every
+filter for CSOANet (v1's recipe), max-norm 1 on the spatial filters and 0.25 on
+the classifier for EEGNet (Lawhern et al. 2018).
 
 Data: EEGMMIDB via mne.datasets.eegbci (downloaded to --data-root on first use).
 Imagery runs 4/8/12 (left vs right fist) and, for --task 4class, 6/10/14 (both
@@ -23,6 +33,8 @@ Normalisation (--norm):
             RAM before inference can start.
 """
 import argparse
+import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -37,12 +49,17 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from deploy.baselines import eegnet_max_norm, make_eegnet  # noqa: E402
 from deploy.profile_model import profile_model  # noqa: E402
 from deploy.quantize import int8_report  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
+from eeg_project.scripts.models.eegnet import EEGNet  # noqa: E402
 
+BAD_SUBJECTS = (88, 92, 100, 104)   # wrong sampling rate or irregular trial timing
+SFREQ = 160.0
 VARIANTS = {
+    "eegnet": lambda ch, t, nc: make_eegnet(ch, t, nc, fs=SFREQ),
     "v1": lambda ch, t, nc: CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
     "v2": lambda ch, t, nc: CSOANetV2(ch, t, nc),
     "v2-dynamic": lambda ch, t, nc: CSOANetV2(ch, t, nc, gate="dynamic"),      # v1's per-trial gate
@@ -50,8 +67,6 @@ VARIANTS = {
     "v2-elu": lambda ch, t, nc: CSOANetV2(ch, t, nc, act="elu"),
     "v2-decim2": lambda ch, t, nc: CSOANetV2(ch, t, nc, decim=2),              # needs --h-freq <= 35
 }
-BAD_SUBJECTS = (88, 92, 100, 104)   # wrong sampling rate or irregular trial timing
-SFREQ = 160.0
 
 
 # ----------------------------------------------------------------------------- data
@@ -144,6 +159,13 @@ def predict(model, X, dev, bs=256):
     return torch.cat([model(X[i:i + bs].to(dev)).argmax(1).cpu() for i in range(0, len(X), bs)]).numpy()
 
 
+def constrain(model):
+    if isinstance(model, EEGNet):
+        eegnet_max_norm(model)
+    else:
+        CSOANetV2.max_norm(model)                                    # identical to v1's max_norm
+
+
 def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
     opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-3)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs, eta_min=a.lr * 0.01)
@@ -164,7 +186,7 @@ def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
-            CSOANetV2.max_norm(model)                                # identical to v1's max_norm
+            constrain(model)
         sch.step()
         acc = float((predict(model, Xva, dev) == Yva.numpy()).mean())
         if acc > best:
@@ -178,10 +200,29 @@ def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
     return best, ep + 1
 
 
+# ----------------------------------------------------------------------------- resume
+def previous_rows(csv, settings_path, settings, fresh):
+    """Rows of earlier runs in the same --out, if they were produced with the same settings."""
+    rows = []
+    if csv.exists() and not fresh:
+        if settings_path.exists():
+            if json.loads(settings_path.read_text()) != settings:
+                sys.exit(f"{csv} was produced with different settings.\n"
+                         f"Use another --out, or --fresh to discard it.")
+            rows = pd.read_csv(csv).to_dict("records")
+            print(f"Resuming: {len({(r['variant'], r['fold']) for r in rows})} (variant, fold) runs already in {csv.name}")
+        else:                                   # written by an older version of this script: settings unknown
+            backup = csv.with_name(csv.stem + "_previous.csv")
+            os.replace(csv, backup)
+            print(f"Found results without recorded settings; kept them as {backup.name} and starting over.")
+    settings_path.write_text(json.dumps(settings, indent=1))
+    return rows
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variants", nargs="+", default=["v1", "v2"], choices=list(VARIANTS))
+    ap.add_argument("--variants", nargs="+", default=["eegnet", "v1", "v2"], choices=list(VARIANTS))
     ap.add_argument("--task", choices=["lr", "4class"], default="4class")
     ap.add_argument("--data-root", default="~/mne_data")
     ap.add_argument("--out", default=str(ROOT / "deploy" / "results"))
@@ -203,13 +244,14 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-amp", action="store_true")
     ap.add_argument("--synthetic", action="store_true", help="random stand-in data, for a smoke test")
+    ap.add_argument("--fresh", action="store_true", help="discard rows from earlier runs in --out")
     a = ap.parse_args()
 
     dev = torch.device("cuda" if a.device == "cuda" and torch.cuda.is_available() else "cpu")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     nc = 2 if a.task == "lr" else 4
-    tag = "synthetic" if a.synthetic else f"physionet_{a.task}"
+    tag = ("synthetic" if a.synthetic else f"physionet_{a.task}") + (f"_n{a.max_subjects}" if a.max_subjects else "")
 
     if a.synthetic:
         X, y, g = load_synthetic(nc, n_subjects=a.max_subjects or 20)
@@ -226,13 +268,11 @@ def main():
     ch, t = X.shape[1], X.shape[2]
     print(f"{tag}: {len(y)} trials, {len(np.unique(g))} subjects, {ch} ch x {t} samples, {nc} classes | {dev}")
 
-    profiles = {}
-    for v in a.variants:
-        m = VARIANTS[v](ch, t, nc)
-        profiles[v] = profile_model(m.fuse() if hasattr(m, "fuse") else m, torch.randn(1, 1, ch, t))
-
-    rows = []
     csv = out / f"{tag}_per_subject.csv"
+    keys = ("task", "norm", "l_freq", "h_freq", "tmin", "tmax", "folds", "val_frac", "epochs", "patience",
+            "lr", "batch", "seed", "calib", "n_calib", "max_subjects", "synthetic")
+    rows = previous_rows(csv, out / f"{tag}_settings.json", {k: getattr(a, k) for k in keys}, a.fresh)
+    done = {(r["variant"], r["fold"]) for r in rows}
     for fold, (tr_s, va_s, te_s) in enumerate(subject_folds(g, a.folds, a.val_frac, a.seed)):
         tr, va, te = (np.flatnonzero(np.isin(g, s)) for s in (tr_s, va_s, te_s))
         Xn = torch.from_numpy(normalise(X, tr, a.norm)).unsqueeze(1)
@@ -240,6 +280,9 @@ def main():
         rng = np.random.default_rng(a.seed + fold)
         calib = Xn[rng.choice(tr, min(a.n_calib, len(tr)), replace=False)].numpy()
         for v in a.variants:
+            if (v, fold) in done:
+                print(f"  fold {fold + 1}/{a.folds} {v:<13} already done, skipped")
+                continue
             t0 = time.time()
             torch.manual_seed(a.seed * 1000 + fold)
             model = VARIANTS[v](ch, t, nc).to(dev)
@@ -259,7 +302,14 @@ def main():
             pd.DataFrame(rows).to_csv(csv, index=False)
 
     df = pd.DataFrame(rows)
-    summ = df.groupby("variant", sort=False).agg(
+    order = [v for v in VARIANTS if v in set(df.variant)]
+    df["variant"] = pd.Categorical(df.variant, order)
+    df = df.sort_values(["variant", "fold", "subject"])
+    profiles = {}
+    for v in order:
+        m = VARIANTS[v](ch, t, nc)
+        profiles[v] = profile_model(m.fuse() if hasattr(m, "fuse") else m, torch.randn(1, 1, ch, t))
+    summ = df.groupby("variant", observed=True).agg(
         subjects=("subject", "nunique"), acc_fp32=("acc_fp32", "mean"), sd_fp32=("acc_fp32", "std"),
         acc_int8=("acc_int8", "mean"), sd_int8=("acc_int8", "std"), int8_agreement=("int8_agreement", "mean"))
     summ["int8_drop"] = summ["acc_fp32"] - summ["acc_int8"]
@@ -269,14 +319,18 @@ def main():
     summ.to_csv(out / f"{tag}_summary.csv")
     print(f"\nPer-subject means (chance = {1 / nc:.2f}); per-subject rows in {csv}")
     print(summ.round(4).to_string())
-    if len(a.variants) > 1 and df.subject.nunique() >= 10:
+    complete = [v for v in order if df[df.variant == v].subject.nunique() == df.subject.nunique()]
+    if len(complete) > 1 and df.subject.nunique() >= 10:
         from scipy.stats import wilcoxon
-        base = a.variants[0]
-        wide = df.pivot(index="subject", columns="variant", values="acc_int8")
-        for v in a.variants[1:]:
-            d = wide[v] - wide[base]
-            pval = wilcoxon(d).pvalue if (d != 0).any() else 1.0
-            print(f"int8 accuracy, {v} minus {base}: {d.mean():+.4f} (paired Wilcoxon over subjects, p = {pval:.3g})")
+        base = "v2" if "v2" in complete else complete[0]
+        for metric in ("acc_fp32", "acc_int8"):
+            wide = df.pivot(index="subject", columns="variant", values=metric)
+            for v in complete:
+                if v == base:
+                    continue
+                d = wide[base] - wide[v]
+                pval = wilcoxon(d).pvalue if (d != 0).any() else 1.0
+                print(f"{metric}: {base} minus {v} = {d.mean():+.4f} (paired Wilcoxon over subjects, p = {pval:.3g})")
 
 
 if __name__ == "__main__":

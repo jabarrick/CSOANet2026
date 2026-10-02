@@ -1,4 +1,4 @@
-"""Static resource profile of CSOANet2026 v1 vs v2, read off the exported ONNX graph.
+"""Static resource profile of EEGNet and CSOANet2026 v1 / v2, read off the exported ONNX graph.
 
 Reports, per model:
   params      weights stored in the graph after BN folding
@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from deploy.baselines import make_eegnet  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
 
@@ -132,9 +133,11 @@ def profile_model(model, example):
         return profile_onnx(export_onnx(model, example, Path(d) / "m.onnx"))
 
 
-def compare(ch, t, nc, decim=1, verbose=False):
+def compare(ch, t, nc, decim=1, verbose=False, fs=160.0):
+    """fs sets EEGNet's kernel lengths; fs=None uses the repository's 1 kHz EEGNet defaults."""
     x = torch.randn(1, 1, ch, t)
     variants = {
+        "EEGNet-8,2": make_eegnet(ch, t, nc, fs),
         "v1 (published)": CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
         "v2": CSOANetV2(ch, t, nc).fuse(),
     }
@@ -161,11 +164,12 @@ if __name__ == "__main__":
     ap.add_argument("--t", type=int)
     ap.add_argument("--nc", type=int, default=2)
     ap.add_argument("--decim", type=int, default=1)
+    ap.add_argument("--fs", type=float, default=160.0, help="sampling rate, sets EEGNet's kernel lengths")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
     if a.ch and a.t:
-        compare(a.ch, a.t, a.nc, a.decim, a.verbose)
+        compare(a.ch, a.t, a.nc, a.decim, a.verbose, a.fs)
     else:
         compare(64, 640, 4, verbose=a.verbose)             # PhysioNet-MI, 160 Hz, 4 s
         compare(64, 640, 2, verbose=a.verbose)
-        compare(62, 2000, 2, decim=4, verbose=a.verbose)   # 1 kHz, 2 s (paper one's input shape)
+        compare(62, 2000, 2, decim=4, verbose=a.verbose, fs=None)   # 1 kHz, 2 s (paper one's input shape)

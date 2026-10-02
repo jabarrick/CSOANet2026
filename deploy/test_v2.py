@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from deploy.baselines import eegnet_max_norm, make_eegnet  # noqa: E402
 from deploy.profile_model import profile_model  # noqa: E402
 from deploy.quantize import export_fp32, float_ops, quantize_int8, run_onnx  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
@@ -98,6 +99,25 @@ def test_onnx_and_int8():
         out = run_onnx(q, X[64:].numpy())
         assert out.shape == (32, nc) and np.isfinite(out).all()
         assert float_ops(q) == [], float_ops(q)          # the whole v2 graph runs in int8
+
+
+def test_eegnet_baseline():
+    torch.manual_seed(0)
+    ch, t, nc = 64, 640, 4
+    m = make_eegnet(ch, t, nc, fs=160.0)
+    assert m.block1[0].kernel_size == (1, 81) and m.block2[0].kernel_size == (1, 21)
+    eegnet_max_norm(m)
+    assert float(m.block1[2].weight.flatten(1).norm(dim=1).max()) <= 1.0 + 1e-5
+    assert float(m.classifier[1].weight.norm(dim=1).max()) <= 0.25 + 1e-5
+    X = torch.randn(48, 1, ch, t)
+    with torch.no_grad():
+        ref = m.eval()(X).numpy()
+    with tempfile.TemporaryDirectory() as d:
+        fp = export_fp32(m, X[:1], Path(d) / "e.onnx")
+        assert np.allclose(run_onnx(fp, X.numpy()), ref, atol=1e-4)
+        q = quantize_int8(fp, X[:32].numpy(), Path(d) / "eq.onnx")
+        assert run_onnx(q, X[32:].numpy()).shape == (16, nc)
+    assert profile_model(m, X[:1])["macs"] > profile_model(CSOANetV2(ch, t, nc).fuse(), X[:1])["macs"]
 
 
 def test_cheaper_than_v1():

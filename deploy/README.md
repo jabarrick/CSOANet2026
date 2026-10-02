@@ -1,17 +1,18 @@
 # CSOANet2026-v2: MCU deployment
 
 A deployment-oriented variant of CSOANet2026 for int8 Cortex-M class targets, plus the
-tooling to profile it, quantize it and compare it against the published v1.
+tooling to profile it, quantize it and compare it against the published v1 and EEGNet-8,2.
 
 Unpack at the repository root (nothing in the existing code is modified), or use the
-folder on its own: it carries a copy of v1's `csoanet2026.py`, so the scripts run from
+folder on its own: it carries copies of `csoanet2026.py` and `eegnet.py`, so the scripts run from
 any location and any working directory.
 
 ```
 eeg_project/scripts/models/csoanet2026_v2.py   the model (train form + fuse() for export)
 deploy/profile_model.py                        params, MACs, peak RAM, read off the ONNX graph
 deploy/quantize.py                             ONNX export, int8 static quantization, int8 inference
-deploy/train_physionet_mi.py                   v1 vs v2 on PhysioNet-MI, float and int8, cross-subject
+deploy/train_physionet_mi.py                   EEGNet, v1, v2 on PhysioNet-MI, float and int8, cross-subject
+deploy/baselines.py                            EEGNet-8,2 built from eeg_project/scripts/models/eegnet.py
 deploy/test_v2.py                              checks
 ```
 
@@ -36,11 +37,14 @@ models share all temporal hyper-parameters.
 
 | Input | Model | Params | MACs | Peak RAM (int8) | Peak RAM, streaming input |
 |-------|-------|-------:|-----:|----------------:|--------------------------:|
-| 64 x 640, 4 classes (PhysioNet-MI) | v1 | 3,918 | 5.05 M | 640 KB | 640 KB |
+| 64 x 640, 4 classes (PhysioNet-MI) | EEGNet-8,2 | 3,572 | 27.29 M | 360 KB | 330 KB |
+| | v1 | 3,918 | 5.05 M | 640 KB | 640 KB |
 | | v2 | 4,068 | 1.58 M | 60 KB | 30 KB |
-| 64 x 640, 2 classes | v1 | 1,692 | 2.51 M | 320 KB | 320 KB |
+| 64 x 640, 2 classes | EEGNet-8,2 | 2,930 | 27.29 M | 360 KB | 330 KB |
+| | v1 | 1,692 | 2.51 M | 320 KB | 320 KB |
 | | v2 | 1,746 | 0.77 M | 50 KB | 15 KB |
-| 62 x 2000, 2 classes (1 kHz, 2 s) | v1 | 2,268 | 21.57 M | 969 KB | 969 KB |
+| 62 x 2000, 2 classes (1 kHz, 2 s) | EEGNet-8,2, repo defaults | 7,266 | 252.11 M | 1,090 KB | 1,000 KB |
+| | v1 | 2,268 | 21.57 M | 969 KB | 969 KB |
 | | v2 | 2,546 | 2.88 M | 152 KB | 47 KB |
 | | v2, decim=4 | 1,682 | 0.59 M | 129 KB | 12 KB |
 
@@ -51,6 +55,11 @@ How to read these numbers:
 - ReLU and Clip are counted as fused into the previous op. ELU is counted as a
   separate op with its own output tensor, which accounts for half of v1's peak.
   A hand-written in-place ELU would bring v1 to about half the figure shown.
+- EEGNet is profiled as published: temporal conv on the raw channels, then spatial
+  conv. Only BatchNorm separates the two, so the spatial-first reordering of change 1
+  could be applied to EEGNet without changing its output. The table compares
+  architectures as written, not the best possible implementation of each. At 160 Hz
+  its kernels follow the paper's rule (fs/2 and fs/8 samples: 81 and 21).
 - "Streaming input" excludes the raw input window. It applies when the spatial
   projection is computed per sample at acquisition time.
 
@@ -67,10 +76,16 @@ recordings. Run it locally:
 ```bash
 pip install -r deploy/requirements.txt
 python deploy/test_v2.py
-python deploy/train_physionet_mi.py --variants v1 v2 v2-dynamic v2-unbounded v2-elu
+python deploy/train_physionet_mi.py                                              # EEGNet, v1, v2
+python deploy/train_physionet_mi.py --variants v2-dynamic v2-unbounded v2-elu    # add the ablations
 ```
 
-It trains each variant with v1's recipe on cross-subject folds, selects the epoch on
+Runs are resumable. Every finished (variant, fold) is saved, and a later call with the
+same settings skips it, so variants can be added one at a time and an interrupted run
+continues where it stopped.
+
+It trains each variant with v1's recipe (EEGNet keeps its own max-norm constraints) on
+cross-subject folds, selects the epoch on
 held-out validation subjects, and reports test accuracy per subject in float32 and in
 int8, with a paired Wilcoxon test across subjects. The ablation variants show which of
 changes 3-5 costs accuracy, if any does.
@@ -78,8 +93,8 @@ changes 3-5 costs accuracy, if any does.
 Two things to keep in mind when reading its output:
 
 - ONNX Runtime's quantizer has no int8 kernel for ELU or ReduceMean, so in v1's
-  "int8" graph those ops (and the pooling next to them) stay in float. v1's int8
-  accuracy from this script is therefore an optimistic bound. v2's graph is int8
+  "int8" graph those ops (and the pooling next to them) stay in float. The same holds
+  for EEGNet's ELU. Their int8 accuracy from this script is therefore an optimistic bound. v2's graph is int8
   throughout (`test_v2.py` asserts this).
 - `--norm fixed` (default) uses one gain per channel from the training subjects,
   which folds into the spatial weights on the device. `--norm epoch_z` is v1's
