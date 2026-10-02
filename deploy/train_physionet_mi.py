@@ -56,6 +56,13 @@ from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
 from eeg_project.scripts.models.eegnet import EEGNet  # noqa: E402
 
+def _relaxed(model):
+    """Train with EEGNet's weight constraints (max-norm 1 on the spatial filters, 0.25 on the
+    classifier) instead of v1's max-norm 0.25 on every filter.  The network is unchanged."""
+    model.relaxed_constraints = True
+    return model
+
+
 BAD_SUBJECTS = (88, 92, 100, 104)   # wrong sampling rate or irregular trial timing
 SFREQ = 160.0
 VARIANTS = {
@@ -67,6 +74,7 @@ VARIANTS = {
     "v2-elu": lambda ch, t, nc: CSOANetV2(ch, t, nc, act="elu"),
     "v2-decim2": lambda ch, t, nc: CSOANetV2(ch, t, nc, decim=2),              # needs --h-freq <= 35
     "v2-longkt": lambda ch, t, nc: CSOANetV2(ch, t, nc, kt=int(SFREQ / 2) | 1),  # 0.5 s temporal kernel, as EEGNet
+    "v2-longkt-relaxed": lambda ch, t, nc: _relaxed(CSOANetV2(ch, t, nc, kt=int(SFREQ / 2) | 1)),
 }
 
 
@@ -163,6 +171,10 @@ def predict(model, X, dev, bs=256):
 def constrain(model):
     if isinstance(model, EEGNet):
         eegnet_max_norm(model)
+    elif getattr(model, "relaxed_constraints", False):
+        with torch.no_grad():
+            model.spatial.weight.copy_(torch.renorm(model.spatial.weight, 2, 0, 1.0))
+            model.fc.weight.copy_(torch.renorm(model.fc.weight, 2, 0, 0.25))
     else:
         CSOANetV2.max_norm(model)                                    # identical to v1's max_norm
 
