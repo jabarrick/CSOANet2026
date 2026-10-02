@@ -66,6 +66,7 @@ VARIANTS = {
     "v2-unbounded": lambda ch, t, nc: CSOANetV2(ch, t, nc, bound=False),       # v1's raw products
     "v2-elu": lambda ch, t, nc: CSOANetV2(ch, t, nc, act="elu"),
     "v2-decim2": lambda ch, t, nc: CSOANetV2(ch, t, nc, decim=2),              # needs --h-freq <= 35
+    "v2-longkt": lambda ch, t, nc: CSOANetV2(ch, t, nc, kt=int(SFREQ / 2) | 1),  # 0.5 s temporal kernel, as EEGNet
 }
 
 
@@ -197,7 +198,9 @@ def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
             if wait >= a.patience:
                 break
     model.load_state_dict(best_state)
-    return best, ep + 1
+    step = max(1, len(Ytr) // 2000)                                  # un-augmented training accuracy, ~2000 trials
+    train_acc = float((predict(model, Xtr[::step], dev) == Ytr[::step].numpy()).mean())
+    return best, ep + 1, train_acc
 
 
 # ----------------------------------------------------------------------------- resume
@@ -286,7 +289,7 @@ def main():
             t0 = time.time()
             torch.manual_seed(a.seed * 1000 + fold)
             model = VARIANTS[v](ch, t, nc).to(dev)
-            val_acc, n_ep = train(model, Xn[tr], Y[tr], Xn[va], Y[va], nc, a, dev)
+            val_acc, n_ep, train_acc = train(model, Xn[tr], Y[tr], Xn[va], Y[va], nc, a, dev)
             model = model.cpu().eval()
             export = model.fuse() if hasattr(model, "fuse") else model
             fp, q, _ = int8_report(export, calib, Xn[te].numpy(), out / "onnx", f"{tag}_{v}_fold{fold}", a.calib)
@@ -296,8 +299,9 @@ def main():
                 rows.append(dict(variant=v, fold=fold, subject=int(s), n_trials=int(k.sum()),
                                  acc_fp32=float((p_fp[k] == yt[k]).mean()),
                                  acc_int8=float((p_q[k] == yt[k]).mean()),
-                                 int8_agreement=float((p_fp[k] == p_q[k]).mean())))
-            print(f"  fold {fold + 1}/{a.folds} {v:<13} val {val_acc:.3f} | test fp32 {(p_fp == yt).mean():.3f}"
+                                 int8_agreement=float((p_fp[k] == p_q[k]).mean()),
+                                 train_acc=train_acc, val_acc=val_acc, epochs=n_ep))
+            print(f"  fold {fold + 1}/{a.folds} {v:<13} train {train_acc:.3f} val {val_acc:.3f} | test fp32 {(p_fp == yt).mean():.3f}"
                   f" int8 {(p_q == yt).mean():.3f} | {n_ep} epochs, {time.time() - t0:.0f}s")
             pd.DataFrame(rows).to_csv(csv, index=False)
 
