@@ -1,13 +1,13 @@
-"""Cross-subject comparison of CSOANet2026 v1 and v2 on PhysioNet-MI, in float and in int8.
+"""EEGNet vs CSOANet2026 v1 / v2 on motor-imagery EEG, in float32 and in int8.
 
-For every variant and fold: train on the training subjects, pick the epoch on
-held-out validation subjects, test on unseen subjects in float32, then export,
-quantize to int8 (calibrated on training trials) and test again.  The question
-the output answers: what does each deployment change cost in accuracy, and how
-much accuracy survives int8.
+For every variant and fold: train, pick the epoch on held-out validation data,
+test in float32, then export, quantize to int8 (calibrated on training trials)
+and test again.
 
-    python deploy/train_physionet_mi.py                           # EEGNet, v1, v2; 4-class, 5 folds
+    python deploy/train_physionet_mi.py                           # PhysioNet-MI, 4-class, 5 subject folds
     python deploy/train_physionet_mi.py --task lr                 # left vs right hand imagery
+    python deploy/train_physionet_mi.py --dataset bci2a           # BCI Competition IV 2a, leave-one-subject-out
+    python deploy/train_physionet_mi.py --dataset bci2a --protocol within-subject   # session 1 -> session 2
     python deploy/train_physionet_mi.py --variants v2-dynamic v2-unbounded v2-elu   # add ablations
     python deploy/train_physionet_mi.py --synthetic --epochs 5    # smoke test, no download
 
@@ -19,15 +19,27 @@ stopped.  --fresh discards earlier rows.
 All variants share the data, split, augmentation, optimiser, schedule and early
 stopping.  Weight constraints are each model's own: max-norm 0.25 on every
 filter for CSOANet (v1's recipe), max-norm 1 on the spatial filters and 0.25 on
-the classifier for EEGNet (Lawhern et al. 2018).
+the classifier for EEGNet (Lawhern et al. 2018).  Kernel lengths follow each
+model's own rule at the dataset's sampling rate.
 
-Data: EEGMMIDB via mne.datasets.eegbci (downloaded to --data-root on first use).
-Imagery runs 4/8/12 (left vs right fist) and, for --task 4class, 6/10/14 (both
-fists vs both feet).  Average reference, 1-40 Hz band-pass, 0-4 s after cue,
-160 Hz -> 64 x 640.  No ICA: it cannot run on the target.
+Datasets (--dataset).  Both: average reference, 1-40 Hz band-pass, 0-4 s after
+the cue, no ICA (it cannot run on the target).
+  physionet  EEGMMIDB via mne.datasets.eegbci.  Imagery runs 4/8/12 (left vs right
+             fist) and, for --task 4class, 6/10/14 (both fists vs both feet).
+             64 channels, 160 Hz -> 64 x 640.
+  bci2a      BCI Competition IV 2a via MOABB (BNCI2014_001, `pip install moabb`).
+             9 subjects, 2 sessions, left hand / right hand / feet / tongue.
+             22 EEG channels, 250 Hz -> 22 x 1000.
+
+Protocols (--protocol).
+  cross-subject   test subjects are never seen in training.  5 folds on PhysioNet,
+                  leave-one-subject-out on 2a.  100 epochs, patience 15, batch 64.
+  within-subject  2a only: per subject, train on the first session (20 % of it held
+                  out for early stopping), test on the second.  This is the usual 2a
+                  benchmark.  500 epochs, patience 80, batch 32; EEGNet dropout 0.5.
 
 Normalisation (--norm):
-  fixed     one gain per channel, estimated on the training subjects.  On the
+  fixed     one gain per channel, estimated on the training trials.  On the
             device this folds into the spatial filter weights and costs nothing.
   epoch_z   v1's per-epoch, per-channel z-score.  Needs the whole raw window in
             RAM before inference can start.
@@ -79,20 +91,29 @@ def _relaxed(model):
     return model
 
 
-BAD_SUBJECTS = (88, 92, 100, 104)   # wrong sampling rate or irregular trial timing
-SFREQ = 160.0
+BAD_SUBJECTS = (88, 92, 100, 104)   # PhysioNet: wrong sampling rate or irregular trial timing
+SFREQ = 160.0                       # PhysioNet
+BCI2A_CLASSES = ("left_hand", "right_hand", "feet", "tongue")
+
+
+def _long(fs):
+    return int(fs / 2) | 1          # 0.5 s temporal kernel, as EEGNet
+
+
+# name -> factory(ch, t, nc, fs, drop); `drop` is EEGNet's dropout, CSOANet takes its own from auto_cfg
 VARIANTS = {
-    "eegnet": lambda ch, t, nc: make_eegnet(ch, t, nc, fs=SFREQ),
-    "eegnet-sf": lambda ch, t, nc: _spatial_first(make_eegnet(ch, t, nc, fs=SFREQ)),   # same net, reordered for export
-    "v1": lambda ch, t, nc: CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
-    "v2": lambda ch, t, nc: CSOANetV2(ch, t, nc),
-    "v2-dynamic": lambda ch, t, nc: CSOANetV2(ch, t, nc, gate="dynamic"),      # v1's per-trial gate
-    "v2-unbounded": lambda ch, t, nc: CSOANetV2(ch, t, nc, bound=False),       # v1's raw products
-    "v2-elu": lambda ch, t, nc: CSOANetV2(ch, t, nc, act="elu"),
-    "v2-decim2": lambda ch, t, nc: CSOANetV2(ch, t, nc, decim=2),              # needs --h-freq <= 35
-    "v2-longkt": lambda ch, t, nc: CSOANetV2(ch, t, nc, kt=int(SFREQ / 2) | 1),  # 0.5 s temporal kernel, as EEGNet
-    "v2-longkt-relaxed": lambda ch, t, nc: _relaxed(CSOANetV2(ch, t, nc, kt=int(SFREQ / 2) | 1)),
+    "eegnet": lambda ch, t, nc, fs, drop: make_eegnet(ch, t, nc, fs=fs, drop=drop),
+    "eegnet-sf": lambda ch, t, nc, fs, drop: _spatial_first(make_eegnet(ch, t, nc, fs=fs, drop=drop)),
+    "v1": lambda ch, t, nc, fs, drop: CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
+    "v2": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc),
+    "v2-dynamic": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, gate="dynamic"),      # v1's per-trial gate
+    "v2-unbounded": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, bound=False),       # v1's raw products
+    "v2-elu": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, act="elu"),
+    "v2-decim2": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, decim=2),              # needs --h-freq <= fs/4.5
+    "v2-longkt": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, kt=_long(fs)),
+    "v2-longkt-relaxed": lambda ch, t, nc, fs, drop: _relaxed(CSOANetV2(ch, t, nc, kt=_long(fs))),
 }
+DEFAULT_VARIANTS = ["eegnet", "eegnet-sf", "v1", "v2", "v2-longkt"]
 
 
 # ----------------------------------------------------------------------------- data
@@ -124,15 +145,42 @@ def load_physionet(root, task, l_freq, h_freq, tmin, tmax, max_subjects=None):
     return np.concatenate(Xs), np.concatenate(ys).astype(np.int64), np.concatenate(gs)
 
 
+def load_bci2a(l_freq, h_freq, tmin, tmax, max_subjects=None, dataset=None):
+    """BCI Competition IV 2a through MOABB.  Returns X (trials, 22, samples), y, subject,
+    session (0 = first / training session, 1 = second / evaluation session) and the sampling rate.
+    `dataset` lets the tests pass a MOABB FakeDataset."""
+    import mne
+    from moabb.paradigms import MotorImagery
+    mne.set_log_level("ERROR")
+    if dataset is None:
+        try:
+            from moabb.datasets import BNCI2014_001 as BCI2A
+        except ImportError:                               # MOABB < 1.0
+            from moabb.datasets import BNCI2014001 as BCI2A
+        dataset, events = BCI2A(), list(BCI2A_CLASSES)
+    else:
+        events = list(dataset.event_id)
+    paradigm = MotorImagery(n_classes=len(events), events=events, fmin=l_freq, fmax=h_freq, tmin=tmin, tmax=tmax)
+    X, labels, meta = paradigm.get_data(dataset=dataset, subjects=list(dataset.subject_list)[:max_subjects])
+    fs = float(round((X.shape[2] - 1) / (tmax - tmin)))
+    X = X[:, :, :int(round((tmax - tmin) * fs))].astype(np.float32)
+    X -= X.mean(axis=1, keepdims=True)                    # average reference (commutes with the band-pass)
+    y = np.array([events.index(lab) for lab in labels], dtype=np.int64)
+    names = sorted(meta["session"].unique())
+    first = [n for n in names if "train" in n.lower() or n in ("session_T", "T")] or names[:1]
+    sess = (~meta["session"].isin(first)).to_numpy().astype(np.int64)
+    return X, y, meta["subject"].to_numpy().astype(np.int64), sess, fs
+
+
 def load_synthetic(nc, n_subjects=20, n_trials=40, ch=64, t=640, seed=0):
     """Pink-ish noise plus a class-specific 8-13 Hz source.  For smoke tests only."""
     rng = np.random.default_rng(seed)
     patterns = rng.standard_normal((nc, ch)).astype(np.float32)
     tt = np.arange(t) / SFREQ
-    X, y, g = [], [], []
+    X, y, g, sess = [], [], [], []
     for s in range(n_subjects):
         gain = rng.uniform(0.5, 2.0)
-        for _ in range(n_trials):
+        for i in range(n_trials):
             c = int(rng.integers(nc))
             noise = np.cumsum(rng.standard_normal((ch, t)), axis=1)
             noise -= noise.mean(1, keepdims=True)
@@ -140,13 +188,14 @@ def load_synthetic(nc, n_subjects=20, n_trials=40, ch=64, t=640, seed=0):
             X.append(gain * (noise / noise.std() * 10 + 6 * np.outer(patterns[c], src)))
             y.append(c)
             g.append(s + 1)
-    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int64), np.asarray(g)
+            sess.append(int(i >= n_trials // 2))
+    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.int64), np.asarray(g), np.asarray(sess)
 
 
 def normalise(X, train_idx, mode):
     if mode == "epoch_z":
         return (X - X.mean(-1, keepdims=True)) / (X.std(-1, keepdims=True) + 1e-8)
-    gain = X[train_idx].std(axis=(0, 2), keepdims=True) + 1e-8      # (1, C, 1), training subjects only
+    gain = X[train_idx].std(axis=(0, 2), keepdims=True) + 1e-8      # (1, C, 1), training trials only
     return X / gain
 
 
@@ -159,6 +208,20 @@ def subject_folds(groups, n_folds, val_frac, seed):
         rest = rest[rng.permutation(len(rest))]
         n_val = max(1, int(round(len(rest) * val_frac)))
         yield rest[n_val:], rest[:n_val], test
+
+
+def make_folds(g, sess, protocol, n_folds, val_frac, seed):
+    """Yield (train_idx, val_idx, test_idx, test_subjects) for each fold."""
+    if protocol == "cross-subject":
+        for tr_s, va_s, te_s in subject_folds(g, n_folds, val_frac, seed):
+            yield tuple(np.flatnonzero(np.isin(g, x)) for x in (tr_s, va_s, te_s)) + (te_s,)
+    else:                                   # within-subject: first session -> second session
+        rng = np.random.default_rng(seed)
+        for s in np.unique(g):
+            first = np.flatnonzero((g == s) & (sess == 0))
+            first = first[rng.permutation(len(first))]
+            n_val = max(1, int(round(len(first) * val_frac)))
+            yield first[n_val:], first[:n_val], np.flatnonzero((g == s) & (sess == 1)), np.array([s])
 
 
 # ----------------------------------------------------------------------------- training (v1 recipe)
@@ -238,7 +301,10 @@ def previous_rows(csv, settings_path, settings, fresh):
     rows = []
     if csv.exists() and not fresh:
         if settings_path.exists():
-            if json.loads(settings_path.read_text()) != settings:
+            old = json.loads(settings_path.read_text())
+            old.setdefault("dataset", "physionet")
+            old.setdefault("protocol", "cross-subject")
+            if old != settings:
                 sys.exit(f"{csv} was produced with different settings.\n"
                          f"Use another --out, or --fresh to discard it.")
             rows = pd.read_csv(csv).to_dict("records")
@@ -254,21 +320,23 @@ def previous_rows(csv, settings_path, settings, fresh):
 # ----------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--variants", nargs="+", default=["eegnet", "v1", "v2"], choices=list(VARIANTS))
-    ap.add_argument("--task", choices=["lr", "4class"], default="4class")
-    ap.add_argument("--data-root", default="~/mne_data")
+    ap.add_argument("--variants", nargs="+", default=DEFAULT_VARIANTS, choices=list(VARIANTS))
+    ap.add_argument("--dataset", choices=["physionet", "bci2a"], default="physionet")
+    ap.add_argument("--protocol", choices=["cross-subject", "within-subject"], default="cross-subject")
+    ap.add_argument("--task", choices=["lr", "4class"], default="4class", help="PhysioNet only")
+    ap.add_argument("--data-root", default="~/mne_data", help="PhysioNet download folder")
     ap.add_argument("--out", default=str(ROOT / "deploy" / "results"))
     ap.add_argument("--norm", choices=["fixed", "epoch_z"], default="fixed")
     ap.add_argument("--l-freq", type=float, default=1.0)
     ap.add_argument("--h-freq", type=float, default=40.0)
     ap.add_argument("--tmin", type=float, default=0.0)
     ap.add_argument("--tmax", type=float, default=4.0)
-    ap.add_argument("--folds", type=int, default=5)
-    ap.add_argument("--val-frac", type=float, default=0.1)
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--patience", type=int, default=15)
+    ap.add_argument("--folds", type=int, default=None, help="cross-subject folds: 5 on PhysioNet, one per subject on 2a")
+    ap.add_argument("--val-frac", type=float, default=None, help="0.1 of the training subjects, or 0.2 of session 1")
+    ap.add_argument("--epochs", type=int, default=None, help="100 cross-subject, 500 within-subject")
+    ap.add_argument("--patience", type=int, default=None, help="15 cross-subject, 80 within-subject")
+    ap.add_argument("--batch", type=int, default=None, help="64 cross-subject, 32 within-subject")
     ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--calib", choices=["minmax", "percentile", "entropy"], default="minmax")
     ap.add_argument("--n-calib", type=int, default=256)
@@ -279,16 +347,28 @@ def main():
     ap.add_argument("--fresh", action="store_true", help="discard rows from earlier runs in --out")
     a = ap.parse_args()
 
+    within = a.protocol == "within-subject"
+    if within and a.dataset != "bci2a" and not a.synthetic:
+        ap.error("--protocol within-subject needs two sessions per subject: use --dataset bci2a")
     dev = torch.device("cuda" if a.device == "cuda" and torch.cuda.is_available() else "cpu")
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    nc = 2 if a.task == "lr" else 4
-    tag = ("synthetic" if a.synthetic else f"physionet_{a.task}") + (f"_n{a.max_subjects}" if a.max_subjects else "")
+    span = f"{a.l_freq:g}-{a.h_freq:g}Hz_{a.tmin:g}-{a.tmax:g}s_n{a.max_subjects or 'all'}"
 
     if a.synthetic:
-        X, y, g = load_synthetic(nc, n_subjects=a.max_subjects or 20)
+        nc, fs, tag = (2 if a.task == "lr" else 4), SFREQ, "synthetic" + ("_within" if within else "")
+        X, y, g, sess = load_synthetic(nc, n_subjects=a.max_subjects or 20)
+    elif a.dataset == "bci2a":
+        nc, tag, cache = 4, "bci2a_" + ("within" if within else "loso"), out / f"cache_bci2a_{span}.npz"
+        if cache.exists():
+            d = np.load(cache)
+            X, y, g, sess, fs = d["X"], d["y"], d["g"], d["sess"], float(d["fs"])
+        else:
+            print("Loading BCI Competition IV 2a through MOABB (first run downloads; later runs use the cache) ...")
+            X, y, g, sess, fs = load_bci2a(a.l_freq, a.h_freq, a.tmin, a.tmax, a.max_subjects)
+            np.savez(cache, X=X, y=y, g=g, sess=sess, fs=fs)
     else:
-        cache = out / f"cache_{a.task}_{a.l_freq:g}-{a.h_freq:g}Hz_{a.tmin:g}-{a.tmax:g}s_n{a.max_subjects or 'all'}.npz"
+        nc, fs, tag, cache = (2 if a.task == "lr" else 4), SFREQ, f"physionet_{a.task}", out / f"cache_{a.task}_{span}.npz"
         if cache.exists():
             d = np.load(cache)
             X, y, g = d["X"], d["y"], d["g"]
@@ -297,18 +377,33 @@ def main():
             X, y, g = load_physionet(Path(a.data_root).expanduser(), a.task, a.l_freq, a.h_freq,
                                      a.tmin, a.tmax, a.max_subjects)
             np.savez(cache, X=X, y=y, g=g)
-    ch, t = X.shape[1], X.shape[2]
-    print(f"{tag}: {len(y)} trials, {len(np.unique(g))} subjects, {ch} ch x {t} samples, {nc} classes | {dev}")
+        sess = np.zeros(len(y), dtype=np.int64)
+    tag += f"_n{a.max_subjects}" if a.max_subjects else ""
+    ch, t, n_sub = X.shape[1], X.shape[2], len(np.unique(g))
+
+    # protocol defaults
+    if a.folds is None:
+        a.folds = n_sub if (within or a.dataset == "bci2a") and not a.synthetic else 5
+    if within:
+        a.folds = n_sub
+    a.val_frac = a.val_frac if a.val_frac is not None else (0.2 if within else 0.1)
+    a.epochs = a.epochs or (500 if within else 100)
+    a.patience = a.patience or (80 if within else 15)
+    a.batch = a.batch or (32 if within else 64)
+    drop = 0.5 if within else 0.25                       # EEGNet: Lawhern et al.'s within / cross-subject values
+    print(f"{tag}: {len(y)} trials, {n_sub} subjects, {ch} ch x {t} samples @ {fs:g} Hz, {nc} classes | "
+          f"{a.protocol}, {a.folds} folds | {dev}")
 
     csv = out / f"{tag}_per_subject.csv"
     keys = ("task", "norm", "l_freq", "h_freq", "tmin", "tmax", "folds", "val_frac", "epochs", "patience",
-            "lr", "batch", "seed", "calib", "n_calib", "max_subjects", "synthetic")
+            "lr", "batch", "seed", "calib", "n_calib", "max_subjects", "synthetic", "dataset", "protocol")
     rows = previous_rows(csv, out / f"{tag}_settings.json", {k: getattr(a, k) for k in keys}, a.fresh)
     done = {(r["variant"], r["fold"]) for r in rows}
-    for fold, (tr_s, va_s, te_s) in enumerate(subject_folds(g, a.folds, a.val_frac, a.seed)):
-        tr, va, te = (np.flatnonzero(np.isin(g, s)) for s in (tr_s, va_s, te_s))
+    Y = torch.from_numpy(y)
+    for fold, (tr, va, te, te_s) in enumerate(make_folds(g, sess, a.protocol, a.folds, a.val_frac, a.seed)):
+        if all((v, fold) in done for v in a.variants):
+            continue
         Xn = torch.from_numpy(normalise(X, tr, a.norm)).unsqueeze(1)
-        Y = torch.from_numpy(y)
         rng = np.random.default_rng(a.seed + fold)
         calib = Xn[rng.choice(tr, min(a.n_calib, len(tr)), replace=False)].numpy()
         for v in a.variants:
@@ -323,7 +418,7 @@ def main():
                 n_ep = 0
             else:
                 torch.manual_seed(a.seed * 1000 + fold)
-                model = VARIANTS[v](ch, t, nc).to(dev)
+                model = VARIANTS[v](ch, t, nc, fs, drop).to(dev)
                 val_acc, n_ep, train_acc = train(model, Xn[tr], Y[tr], Xn[va], Y[va], nc, a, dev)
                 export = deploy_form(model.cpu().eval())
             fp, q, _ = int8_report(export, calib, Xn[te].numpy(), out / "onnx", f"{tag}_{v}_fold{fold}", a.calib)
@@ -346,7 +441,7 @@ def main():
     df = df.sort_values(["variant", "fold", "subject"])
     profiles = {}
     for v in order:
-        profiles[v] = profile_model(deploy_form(VARIANTS[v](ch, t, nc)), torch.randn(1, 1, ch, t))
+        profiles[v] = profile_model(deploy_form(VARIANTS[v](ch, t, nc, fs, drop)), torch.randn(1, 1, ch, t))
     summ = df.groupby("variant", observed=True).agg(
         subjects=("subject", "nunique"), acc_fp32=("acc_fp32", "mean"), sd_fp32=("acc_fp32", "std"),
         acc_int8=("acc_int8", "mean"), sd_int8=("acc_int8", "std"), int8_agreement=("int8_agreement", "mean"))
@@ -357,18 +452,20 @@ def main():
     summ.to_csv(out / f"{tag}_summary.csv")
     print(f"\nPer-subject means (chance = {1 / nc:.2f}); per-subject rows in {csv}")
     print(summ.round(4).to_string())
-    complete = [v for v in order if df[df.variant == v].subject.nunique() == df.subject.nunique()]
-    if len(complete) > 1 and df.subject.nunique() >= 10:
+    n = df.subject.nunique()
+    complete = [v for v in order if df[df.variant == v].subject.nunique() == n]
+    if len(complete) > 1 and n >= 6:
         from scipy.stats import wilcoxon
-        base = "v2" if "v2" in complete else complete[0]
+        ref = next((v for v in ("eegnet-sf", "eegnet") if v in complete), complete[0])
+        note = f"paired Wilcoxon over {n} subjects" + ("; few subjects, low power" if n < 20 else "")
         for metric in ("acc_fp32", "acc_int8"):
             wide = df.pivot(index="subject", columns="variant", values=metric)
             for v in complete:
-                if v == base:
+                if v == ref:
                     continue
-                d = wide[base] - wide[v]
+                d = wide[v] - wide[ref]
                 pval = wilcoxon(d).pvalue if (d != 0).any() else 1.0
-                print(f"{metric}: {base} minus {v} = {d.mean():+.4f} (paired Wilcoxon over subjects, p = {pval:.3g})")
+                print(f"{metric}: {v} minus {ref} = {d.mean():+.4f} ({note}, p = {pval:.3g})")
 
 
 if __name__ == "__main__":

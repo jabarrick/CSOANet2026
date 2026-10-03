@@ -11,7 +11,7 @@ any location and any working directory.
 eeg_project/scripts/models/csoanet2026_v2.py   the model (train form + fuse() for export)
 deploy/profile_model.py                        params, MACs, peak RAM, read off the ONNX graph
 deploy/quantize.py                             ONNX export, int8 static quantization, int8 inference
-deploy/train_physionet_mi.py                   EEGNet, v1, v2 on PhysioNet-MI, float and int8, cross-subject
+deploy/train_physionet_mi.py                   EEGNet, v1, v2 on PhysioNet-MI or BCI IV 2a, float and int8
 deploy/baselines.py                            EEGNet-8,2 built from eeg_project/scripts/models/eegnet.py
 deploy/test_v2.py                              checks
 ```
@@ -41,9 +41,12 @@ models share all temporal hyper-parameters.
 | | EEGNet-8,2, spatial-first | 4,212 | 1.58 M | 50 KB | 20 KB |
 | | v1 | 3,918 | 5.05 M | 640 KB | 640 KB |
 | | v2 | 4,068 | 1.58 M | 60 KB | 30 KB |
-| 64 x 640, 2 classes | EEGNet-8,2 | 2,930 | 27.29 M | 360 KB | 330 KB |
-| | v1 | 1,692 | 2.51 M | 320 KB | 320 KB |
-| | v2 | 1,746 | 0.77 M | 50 KB | 15 KB |
+| | v2-longkt | 6,244 | 2.28 M | 60 KB | 30 KB |
+| 22 x 1000, 4 classes (BCI IV 2a) | EEGNet-8,2 | 4,116 | 22.54 M | 193 KB | 188 KB |
+| | EEGNet-8,2, spatial-first | 5,108 | 2.54 M | 37 KB | 31 KB |
+| | v1 | 2,958 | 4.29 M | 344 KB | 344 KB |
+| | v2 | 3,236 | 1.28 M | 53 KB | 47 KB |
+| | v2-longkt | 6,564 | 2.95 M | 53 KB | 47 KB |
 | 62 x 2000, 2 classes (1 kHz, 2 s) | EEGNet-8,2, repo defaults | 7,266 | 252.11 M | 1,090 KB | 1,000 KB |
 | | v1 | 2,268 | 21.57 M | 969 KB | 969 KB |
 | | v2 | 2,546 | 2.88 M | 152 KB | 47 KB |
@@ -82,6 +85,13 @@ python deploy/test_v2.py
 python deploy/train_physionet_mi.py                                              # EEGNet, v1, v2
 python deploy/train_physionet_mi.py --variants v2-dynamic v2-unbounded v2-elu    # add the ablations
 python deploy/train_physionet_mi.py --variants eegnet-sf                         # reorder the trained EEGNet
+```
+
+The same comparison on BCI Competition IV 2a (downloaded through MOABB, `pip install moabb`):
+
+```bash
+python deploy/train_physionet_mi.py --dataset bci2a                              # leave-one-subject-out
+python deploy/train_physionet_mi.py --dataset bci2a --protocol within-subject    # session 1 -> session 2
 ```
 
 `eegnet-sf` does not train: it rewrites each fold's trained EEGNet spatial-first and

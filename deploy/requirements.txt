@@ -5,3 +5,4 @@ scipy>=1.10
 mne>=1.8.0
 onnx>=1.15
 onnxruntime>=1.17
+moabb>=1.0      # only for --dataset bci2a

@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from deploy.baselines import make_eegnet  # noqa: E402
+from deploy.baselines import EEGNetSpatialFirst, make_eegnet  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
 
@@ -136,11 +136,15 @@ def profile_model(model, example):
 def compare(ch, t, nc, decim=1, verbose=False, fs=160.0):
     """fs sets EEGNet's kernel lengths; fs=None uses the repository's 1 kHz EEGNet defaults."""
     x = torch.randn(1, 1, ch, t)
+    eegnet = make_eegnet(ch, t, nc, fs)
     variants = {
-        "EEGNet-8,2": make_eegnet(ch, t, nc, fs),
+        "EEGNet-8,2": eegnet,
+        "EEGNet spatial-1st": EEGNetSpatialFirst.from_module(eegnet),
         "v1 (published)": CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
         "v2": CSOANetV2(ch, t, nc).fuse(),
     }
+    if fs:
+        variants["v2-longkt"] = CSOANetV2(ch, t, nc, kt=int(fs / 2) | 1).fuse()
     if decim > 1:
         variants[f"v2, decim={decim}"] = CSOANetV2(ch, t, nc, decim=decim).fuse()
     rows = {k: profile_model(m, x) for k, m in variants.items()}
@@ -171,5 +175,5 @@ if __name__ == "__main__":
         compare(a.ch, a.t, a.nc, a.decim, a.verbose, a.fs)
     else:
         compare(64, 640, 4, verbose=a.verbose)             # PhysioNet-MI, 160 Hz, 4 s
-        compare(64, 640, 2, verbose=a.verbose)
+        compare(22, 1000, 4, verbose=a.verbose, fs=250.0)  # BCI Competition IV 2a, 250 Hz, 4 s
         compare(62, 2000, 2, decim=4, verbose=a.verbose, fs=None)   # 1 kHz, 2 s (paper one's input shape)
