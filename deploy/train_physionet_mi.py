@@ -22,6 +22,12 @@ filter for CSOANet (v1's recipe), max-norm 1 on the spatial filters and 0.25 on
 the classifier for EEGNet (Lawhern et al. 2018).  Kernel lengths follow each
 model's own rule at the dataset's sampling rate.
 
+The shared recipe is v1's (AdamW, cosine schedule, mixup, crop, noise, channel
+drop, label smoothing, early stopping on validation accuracy).  `eegnet-orig`
+trains EEGNet with its own published recipe instead: Adam at 1e-3, plain cross-
+entropy, no augmentation, constant learning rate, all epochs, keeping the
+checkpoint with the lowest validation loss.  It is exported spatial-first.
+
 Datasets (--dataset).  Both: average reference, 1-40 Hz band-pass, 0-4 s after
 the cue, no ICA (it cannot run on the target).
   physionet  EEGMMIDB via mne.datasets.eegbci.  Imagery runs 4/8/12 (left vs right
@@ -84,6 +90,12 @@ def deploy_form(model):
     return model
 
 
+def _lawhern(model):
+    """Train with EEGNet's own recipe (Lawhern et al. 2018) instead of the shared v1 recipe."""
+    model.recipe = "lawhern"
+    return model
+
+
 def _relaxed(model):
     """Train with EEGNet's weight constraints (max-norm 1 on the spatial filters, 0.25 on the
     classifier) instead of v1's max-norm 0.25 on every filter.  The network is unchanged."""
@@ -104,6 +116,7 @@ def _long(fs):
 VARIANTS = {
     "eegnet": lambda ch, t, nc, fs, drop: make_eegnet(ch, t, nc, fs=fs, drop=drop),
     "eegnet-sf": lambda ch, t, nc, fs, drop: _spatial_first(make_eegnet(ch, t, nc, fs=fs, drop=drop)),
+    "eegnet-orig": lambda ch, t, nc, fs, drop: _lawhern(_spatial_first(make_eegnet(ch, t, nc, fs=fs, drop=drop))),
     "v1": lambda ch, t, nc, fs, drop: CSOANet2026(auto_cfg(ch, t, nc), nc=nc),
     "v2": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc),
     "v2-dynamic": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, gate="dynamic"),      # v1's per-trial gate
@@ -259,12 +272,24 @@ def constrain(model):
         CSOANetV2.max_norm(model)                                    # identical to v1's max_norm
 
 
+@torch.no_grad()
+def val_loss(model, X, Y, dev, bs=256):
+    model.eval()
+    logits = torch.cat([model(X[i:i + bs].to(dev)).float().cpu() for i in range(0, len(X), bs)])
+    return float(F.cross_entropy(logits, Y)), float((logits.argmax(1) == Y).float().mean())
+
+
 def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
-    opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-3)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs, eta_min=a.lr * 0.01)
+    """Shared v1 recipe, or EEGNet's own recipe when model.recipe == "lawhern"."""
+    lawhern = getattr(model, "recipe", None) == "lawhern"
+    if lawhern:
+        opt, sch = torch.optim.Adam(model.parameters(), lr=a.lr), None
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-3)
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs, eta_min=a.lr * 0.01)
     amp = dev.type == "cuda" and not a.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
-    best, best_state, wait = -1.0, None, 0
+    best, best_loss, best_state, wait, best_ep = -1.0, float("inf"), None, 0, 0
     for ep in range(a.epochs):
         model.train()
         perm = torch.randperm(len(Ytr))
@@ -272,7 +297,10 @@ def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
             idx = perm[i:i + a.batch]
             if len(idx) < 2:
                 continue
-            xb, yb = augment(Xtr[idx].to(dev), Ytr[idx].to(dev), nc)
+            if lawhern:
+                xb, yb = Xtr[idx].to(dev), F.one_hot(Ytr[idx].to(dev), nc).float()
+            else:
+                xb, yb = augment(Xtr[idx].to(dev), Ytr[idx].to(dev), nc)
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=amp):
                 loss = -(yb * F.log_softmax(model(xb).float(), 1)).sum(1).mean()
@@ -280,10 +308,17 @@ def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
             scaler.step(opt)
             scaler.update()
             constrain(model)
-        sch.step()
+        if sch is not None:
+            sch.step()
+        if lawhern:                              # all epochs, keep the lowest validation loss
+            vl, acc = val_loss(model, Xva, Yva, dev)
+            if vl < best_loss:
+                best_loss, best, best_ep = vl, acc, ep + 1
+                best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            continue
         acc = float((predict(model, Xva, dev) == Yva.numpy()).mean())
         if acc > best:
-            best, wait = acc, 0
+            best, wait, best_ep = acc, 0, ep + 1
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             wait += 1
