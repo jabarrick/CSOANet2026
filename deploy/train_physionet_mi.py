@@ -27,6 +27,8 @@ drop, label smoothing, early stopping on validation accuracy).  `eegnet-orig`
 trains EEGNet with its own published recipe instead: Adam at 1e-3, plain cross-
 entropy, no augmentation, constant learning rate, all epochs, keeping the
 checkpoint with the lowest validation loss.  It is exported spatial-first.
+`v2-longkt-lawhern` trains v2-longkt with that same recipe (keeping CSOANet's own
+weight constraints), so recipe and architecture can be separated.
 
 Datasets (--dataset).  Both: average reference, 1-40 Hz band-pass, 0-4 s after
 the cue, no ICA (it cannot run on the target).
@@ -125,6 +127,7 @@ VARIANTS = {
     "v2-decim2": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, decim=2),              # needs --h-freq <= fs/4.5
     "v2-longkt": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, kt=_long(fs)),
     "v2-longkt-relaxed": lambda ch, t, nc, fs, drop: _relaxed(CSOANetV2(ch, t, nc, kt=_long(fs))),
+    "v2-longkt-lawhern": lambda ch, t, nc, fs, drop: _lawhern(CSOANetV2(ch, t, nc, kt=_long(fs))),  # EEGNet's recipe
 }
 DEFAULT_VARIANTS = ["eegnet", "eegnet-sf", "v1", "v2", "v2-longkt"]
 
