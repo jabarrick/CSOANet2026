@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from deploy.baselines import EEGNetSpatialFirst, make_eegnet  # noqa: E402
+from deploy.mibminet import MIBMInet  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
 
@@ -145,6 +146,7 @@ def compare(ch, t, nc, decim=1, verbose=False, fs=160.0):
     }
     if fs:
         variants["v2-longkt"] = CSOANetV2(ch, t, nc, kt=int(fs / 2) | 1).fuse()
+        variants["MI-BMInet"] = MIBMInet(ch, t, nc, fs=fs)
     if decim > 1:
         variants[f"v2, decim={decim}"] = CSOANetV2(ch, t, nc, decim=decim).fuse()
     rows = {k: profile_model(m, x) for k, m in variants.items()}

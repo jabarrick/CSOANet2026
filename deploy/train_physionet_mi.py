@@ -29,6 +29,12 @@ entropy, no augmentation, constant learning rate, all epochs, keeping the
 checkpoint with the lowest validation loss.  It is exported spatial-first.
 `v2-longkt-lawhern` trains v2-longkt with that same recipe (keeping CSOANet's own
 weight constraints), so recipe and architecture can be separated.
+`mibminet` is MI-BMInet (Wang et al. 2024, deploy/mibminet.py) with its paper's
+recipe: Adam (eps 1e-7), plain cross-entropy, no augmentation, no weight
+constraints; cross-subject batch 16 and learning rate 1e-2 -> 1e-3 -> 1e-4 at 40 %
+and 80 % of the epochs, within-subject batch 32 at a constant 1e-3; all epochs,
+lowest-validation-loss checkpoint.  Dropout 0.2 cross-subject, 0.5 within-subject,
+as in the authors' reference configurations.
 
 Datasets (--dataset).  Both: average reference, 1-40 Hz band-pass, 0-4 s after
 the cue, no ICA (it cannot run on the target).
@@ -70,6 +76,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from deploy.baselines import EEGNetSpatialFirst, eegnet_max_norm, make_eegnet  # noqa: E402
+from deploy.mibminet import MIBMInet  # noqa: E402
 from deploy.profile_model import profile_model  # noqa: E402
 from deploy.quantize import int8_report  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
@@ -96,6 +103,12 @@ def _lawhern(model):
     """Train with EEGNet's own recipe (Lawhern et al. 2018) instead of the shared v1 recipe."""
     model.recipe = "lawhern"
     return model
+
+
+def _mibminet(ch, t, nc, fs, drop):
+    m = MIBMInet(ch, t, nc, fs=fs, p_dropout=0.5 if drop >= 0.5 else 0.2)   # drop 0.5 <=> within-subject
+    m.recipe = "mibminet"
+    return m
 
 
 def _relaxed(model):
@@ -128,8 +141,9 @@ VARIANTS = {
     "v2-longkt": lambda ch, t, nc, fs, drop: CSOANetV2(ch, t, nc, kt=_long(fs)),
     "v2-longkt-relaxed": lambda ch, t, nc, fs, drop: _relaxed(CSOANetV2(ch, t, nc, kt=_long(fs))),
     "v2-longkt-lawhern": lambda ch, t, nc, fs, drop: _lawhern(CSOANetV2(ch, t, nc, kt=_long(fs))),  # EEGNet's recipe
+    "mibminet": _mibminet,
 }
-DEFAULT_VARIANTS = ["eegnet", "eegnet-sf", "v1", "v2", "v2-longkt"]
+DEFAULT_VARIANTS = ["eegnet", "eegnet-sf", "v1", "v2", "v2-longkt"]   # others are added explicitly
 
 
 # ----------------------------------------------------------------------------- data
@@ -265,6 +279,8 @@ def predict(model, X, dev, bs=256):
 
 
 def constrain(model):
+    if isinstance(model, MIBMInet):
+        return                                                       # the paper uses no weight constraints
     if isinstance(model, EEGNet):
         eegnet_max_norm(model)
     elif getattr(model, "relaxed_constraints", False):
@@ -283,10 +299,18 @@ def val_loss(model, X, Y, dev, bs=256):
 
 
 def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
-    """Shared v1 recipe, or EEGNet's own recipe when model.recipe == "lawhern"."""
-    lawhern = getattr(model, "recipe", None) == "lawhern"
-    if lawhern:
+    """Shared v1 recipe, or a model's own published recipe (model.recipe "lawhern" / "mibminet")."""
+    recipe = getattr(model, "recipe", None)
+    lawhern = recipe in ("lawhern", "mibminet")                      # plain training, lowest-val-loss checkpoint
+    batch = a.batch
+    if recipe == "lawhern":
         opt, sch = torch.optim.Adam(model.parameters(), lr=a.lr), None
+    elif recipe == "mibminet" and getattr(model, "within", False):
+        opt, sch = torch.optim.Adam(model.parameters(), lr=1e-3, eps=1e-7), None
+    elif recipe == "mibminet":
+        batch = 16
+        opt = torch.optim.Adam(model.parameters(), lr=1e-2, eps=1e-7)
+        sch = torch.optim.lr_scheduler.MultiStepLR(opt, [int(0.4 * a.epochs), int(0.8 * a.epochs)], 0.1)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=1e-3)
         sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=a.epochs, eta_min=a.lr * 0.01)
@@ -296,8 +320,8 @@ def train(model, Xtr, Ytr, Xva, Yva, nc, a, dev):
     for ep in range(a.epochs):
         model.train()
         perm = torch.randperm(len(Ytr))
-        for i in range(0, len(perm), a.batch):
-            idx = perm[i:i + a.batch]
+        for i in range(0, len(perm), batch):
+            idx = perm[i:i + batch]
             if len(idx) < 2:
                 continue
             if lawhern:
@@ -457,6 +481,7 @@ def main():
             else:
                 torch.manual_seed(a.seed * 1000 + fold)
                 model = VARIANTS[v](ch, t, nc, fs, drop).to(dev)
+                model.within = within
                 val_acc, n_ep, train_acc = train(model, Xn[tr], Y[tr], Xn[va], Y[va], nc, a, dev)
                 export = deploy_form(model.cpu().eval())
             fp, q, _ = int8_report(export, calib, Xn[te].numpy(), out / "onnx", f"{tag}_{v}_fold{fold}", a.calib)

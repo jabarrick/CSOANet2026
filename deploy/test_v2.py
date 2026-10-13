@@ -136,6 +136,22 @@ def test_eegnet_spatial_first_is_exact():
     assert profile_model(EEGNetSpatialFirst.from_module(m), x)["macs"] < profile_model(m, x)["macs"] / 10
 
 
+def test_mibminet_matches_paper():
+    from deploy.mibminet import MIBMInet, paper_param_count
+    assert paper_param_count(MIBMInet(64, 480, 4, fs=160.0)) == 4228      # PhysioNet MM/MI, 3 s
+    assert paper_param_count(MIBMInet(22, 750, 4, fs=250.0)) == 6084      # BCI IV 2a, 3 s
+    m = MIBMInet(22, 1000, 4, fs=250.0).eval()
+    X = torch.randn(40, 1, 22, 1000)
+    with torch.no_grad():
+        ref = m(X).numpy()
+    with tempfile.TemporaryDirectory() as d:
+        fp = export_fp32(m, X[:1], Path(d) / "mb.onnx")
+        assert np.allclose(run_onnx(fp, X.numpy()), ref, atol=1e-4)
+        q = quantize_int8(fp, X[:32].numpy(), Path(d) / "mbq.onnx")
+        assert run_onnx(q, X[32:].numpy()).shape == (8, 4)
+        assert float_ops(q) == [], float_ops(q)
+
+
 def test_cheaper_than_v1():
     for ch, t, nc in [(64, 640, 4), (62, 2000, 2)]:
         x = torch.randn(1, 1, ch, t)
