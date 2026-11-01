@@ -357,6 +357,148 @@ def test_synthetic_cells_have_documented_shapes():
         assert set(d["session"]) == ({0, 1} if cell != "F1b" else {0})
 
 
+# ----------------------------------------------------------------------------- item 4: runner
+from deploy import prereg_run as prun  # noqa: E402
+
+
+def test_registered_architectures():
+    from deploy.mibminet import MIBMInet
+    from eeg_project.scripts.models.convnets import ShallowConvNet
+    from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2
+    from eeg_project.scripts.models.eegnet import EEGNet
+    for ch, t in ((62, 1000), (64, 750)):
+        for protocol, e_drop, m_drop in (("cross-subject", 0.25, 0.2), ("within-subject", 0.5, 0.5)):
+            e = prun.build_model("eegnet", ch, t, protocol)
+            assert isinstance(e, EEGNet) and e.block1[0].kernel_size == (1, 125) and e.block2[0].kernel_size == (1, 31)
+            assert {m.p for m in e.modules() if isinstance(m, nn.Dropout)} == {e_drop}
+            sh = prun.build_model("shallow", ch, t, protocol)
+            assert isinstance(sh, ShallowConvNet) and sh.temporal.kernel_size == (1, 25)
+            assert {m.p for m in sh.classifier.modules() if isinstance(m, nn.Dropout)} == {0.5}
+            mb = prun.build_model("mibminet", ch, t, protocol)
+            assert isinstance(mb, MIBMInet) and (mb.c["nk"], mb.c["nf"], mb.c["p_dropout"]) == (32, 64, m_drop)
+            cs = prun.build_model("csoanet", ch, t, protocol)
+            assert isinstance(cs, CSOANetV2) and cs.temporal.kernel_size == (1, 125)
+            assert (cs.c["gate"], cs.c["bound"], cs.c["act"]) == ("static", True, "relu")
+    # own constraints under every recipe
+    from deploy.train_physionet_mi import constrain
+    for arch in prun.ARCHS:
+        m = prun.build_model(arch, 62, 1000, "cross-subject")
+        with torch.no_grad():
+            for p in m.parameters():
+                p.mul_(50)
+        constrain(m)
+        if arch == "eegnet":
+            assert float(m.block1[2].weight.flatten(1).norm(dim=1).max()) <= 1 + 1e-5
+            assert float(m.classifier[1].weight.norm(dim=1).max()) <= 0.25 + 1e-5
+        elif arch == "csoanet":
+            assert float(m.spatial.weight.flatten(1).norm(dim=1).max()) <= 0.25 + 1e-5
+        else:
+            assert float(next(m.parameters()).abs().max()) > 1
+
+
+def test_nonfinite_retry():
+    calls = []
+    real = prun.prec.train_recipe
+
+    def fake(model, recipe, *a, **k):
+        calls.append(torch.initial_seed())
+        r = real(model, recipe, *a, **{**k, "epochs": 1})
+        r["finite"] = len(calls) > 1 if fake.mode == "once" else False
+        return r
+    X, Y = torch.randn(40, 1, 62, 1000), torch.randint(0, 2, (40,))
+    fold = type("F", (), dict(Xtr=X[:30], Ytr=Y[:30], Xva=X[30:], Yva=Y[30:], ch=62, t=1000))()
+    try:
+        prun.prec.train_recipe = fake
+        for mode, finite in (("once", True), ("twice", False)):
+            calls.clear()
+            fake.mode = mode
+            _, res = prun.fit("mibminet", pr.RECIPES["R2"], fold, "cross-subject", 2, torch.device("cpu"))
+            assert calls == [2, 102] and res["seed_used"] == 102 and res["retried"] and res["finite"] == finite
+    finally:
+        prun.prec.train_recipe = real
+
+
+def test_tuning_never_sees_test_trials():
+    d = pdata.synthetic_cell("F2", n_subjects=12, trials_per_session=4)
+    folds = pdata.make_folds("F2", d)
+    units = prun.tuning_units("F2", d, folds)
+    assert [u["fold"] for u in units] == list(range(1, 11))          # the 10 lowest subject IDs
+    for u in units:
+        assert len(u["test"]) == 0 and (d["session"][np.r_[u["train"], u["val"]]] == 0).all()
+    d = pdata.synthetic_cell("F1a", n_subjects=20, trials_per_session=2)
+    folds = pdata.make_folds("F1a", d)
+    (u,) = prun.tuning_units("F1a", d, folds)
+    assert np.array_equal(u["train"], folds[0]["train"]) and np.array_equal(u["val"], folds[0]["val"])
+    assert len(u["test"]) == 0
+    seen = []
+    orig = prun.Fold.test
+    prun.Fold.test = lambda self: seen.append(1) or orig(self)
+    try:
+        with tempfile.TemporaryDirectory() as out:
+            best = prun.tune("F1a", d, folds, ["csoanet"], Path(out), "x", torch.device("cpu"), 2, epochs=1)
+    finally:
+        prun.Fold.test = orig
+    assert not seen and best["csoanet"].name in ("T00", "T01")
+
+
+def _run(out, *extra):
+    return prun.main(["--cell", "F2", "--synthetic", "--synthetic-subjects", "3", "--epochs", "1", "--patience", "1",
+                      "--t-configs", "2", "--device", "cpu", "--out", str(out), "--archs", "csoanet", "eegnet",
+                      *extra])
+
+
+def test_runner_end_to_end_and_resume():
+    import pandas as pd
+    with tempfile.TemporaryDirectory() as out:
+        csv = _run(out, "--recipes", "R2", "T", "--seeds", "0", "1")
+        df = pd.read_csv(csv)
+        assert len(df) == 2 * 2 * 3 * 2                                   # arch x recipe x subject x seed
+        assert set(df.recipe) == {"R2", "T"} and set(df.t_config.dropna()) <= {"T00", "T01"}
+        cols = {"cell", "arch", "recipe", "fold", "subject", "seed", "seed_used", "retried", "bacc_fp32", "bacc_int8",
+                "agreement", "train_acc", "val_acc", "selected_epoch", "n_test"}
+        assert cols <= set(df.columns)
+        assert df.bacc_fp32.between(0, 1).all() and df.bacc_int8.between(0, 1).all()
+        assert df[df.arch == "eegnet"].bacc_int8_sf.notna().all()       # spatial-first extra column
+        assert (df.n_test == 40).all()                                    # session 2 of each subject
+        mtime = Path(csv).stat().st_mtime_ns
+        _run(out, "--recipes", "R2", "T", "--seeds", "0", "1")            # resume: nothing left to do
+        assert Path(csv).stat().st_mtime_ns == mtime and len(pd.read_csv(csv)) == len(df)
+        _run(out, "--recipes", "R2", "R4", "--seeds", "0", "1")           # adds R4 only
+        assert len(pd.read_csv(csv)) == len(df) + 12
+        prof = pd.read_csv(Path(out) / "F2_synthetic_profiles.csv")
+        assert set(prof.form) == {"standard", "spatial-first"} and (prof.macs > 0).all()
+        assert (Path(out) / "F2_synthetic_exclusions.csv").exists()
+        try:
+            prun.main(["--cell", "F2", "--synthetic", "--synthetic-subjects", "3", "--epochs", "2", "--out", out,
+                       "--device", "cpu"])
+            raise AssertionError("changed settings must stop the run")
+        except SystemExit:
+            pass
+
+
+def test_runner_refuses_real_cells_and_overrides():
+    with _locked_env(), tempfile.TemporaryDirectory() as out:
+        for cell in pdata.CELLS:
+            try:
+                prun.main(["--cell", cell, "--out", out, "--device", "cpu"])
+                raise AssertionError(cell)
+            except pdata.ConfirmatoryLocked:
+                pass
+        for extra in (["--epochs", "3"], ["--seeds", "0"], ["--t-configs", "3"]):
+            try:
+                prun.main(["--cell", "F1a", "--out", out, *extra])
+                raise AssertionError(extra)
+            except SystemExit:
+                pass
+        # a cache file of a confirmatory cell is the dataset itself: reading it is locked too
+        np.savez(Path(out) / "cache_Lee2019_MI_F1a.npz", X=np.zeros(1))
+        try:
+            prun.load_data("F1a", Path(out), False, 0)
+            raise AssertionError
+        except pdata.ConfirmatoryLocked:
+            pass
+
+
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
