@@ -29,6 +29,8 @@ entropy, no augmentation, constant learning rate, all epochs, keeping the
 checkpoint with the lowest validation loss.  It is exported spatial-first.
 `v2-longkt-lawhern` trains v2-longkt with that same recipe (keeping CSOANet's own
 weight constraints), so recipe and architecture can be separated.
+`shallow` is ShallowConvNet (Schirrmeister et al. 2017, no weight constraints)
+under the shared recipe.
 `mibminet` is MI-BMInet (Wang et al. 2024, deploy/mibminet.py) with its paper's
 recipe: Adam (eps 1e-7), plain cross-entropy, no augmentation, no weight
 constraints; cross-subject batch 16 and learning rate 1e-2 -> 1e-3 -> 1e-4 at 40 %
@@ -81,6 +83,7 @@ from deploy.profile_model import profile_model  # noqa: E402
 from deploy.quantize import int8_report  # noqa: E402
 from eeg_project.scripts.models.csoanet2026 import CSOANet2026, auto_cfg  # noqa: E402
 from eeg_project.scripts.models.csoanet2026_v2 import CSOANetV2  # noqa: E402
+from eeg_project.scripts.models.convnets import ShallowConvNet  # noqa: E402
 from eeg_project.scripts.models.eegnet import EEGNet  # noqa: E402
 
 def _spatial_first(model):
@@ -142,6 +145,9 @@ VARIANTS = {
     "v2-longkt-relaxed": lambda ch, t, nc, fs, drop: _relaxed(CSOANetV2(ch, t, nc, kt=_long(fs))),
     "v2-longkt-lawhern": lambda ch, t, nc, fs, drop: _lawhern(CSOANetV2(ch, t, nc, kt=_long(fs))),  # EEGNet's recipe
     "mibminet": _mibminet,
+    # Schirrmeister et al. 2017: 40 temporal filters (25 samples), 40 spatial, square, mean-pool 75 / 15, log,
+    # dropout 0.5, no weight constraints.  The 25-sample kernel is the paper's value at 250 Hz.
+    "shallow": lambda ch, t, nc, fs, drop: ShallowConvNet(ch, t, nc),
 }
 DEFAULT_VARIANTS = ["eegnet", "eegnet-sf", "v1", "v2", "v2-longkt"]   # others are added explicitly
 
@@ -279,8 +285,8 @@ def predict(model, X, dev, bs=256):
 
 
 def constrain(model):
-    if isinstance(model, MIBMInet):
-        return                                                       # the paper uses no weight constraints
+    if isinstance(model, (MIBMInet, ShallowConvNet)):
+        return                                                       # their papers use no weight constraints
     if isinstance(model, EEGNet):
         eegnet_max_norm(model)
     elif getattr(model, "relaxed_constraints", False):

@@ -35,3 +35,8 @@ D:/CxAlign_cache/
 
 # CSV results are KEPT (not ignored) for reproducibility:
 # eeg_project/results/*.csv  ← intentionally NOT in this list
+
+# Preregistered study outputs (the cache_*.npz files hold confirmatory data: never commit them)
+deploy/prereg_results/
+deploy/prereg_analysis/
+deploy/results/
