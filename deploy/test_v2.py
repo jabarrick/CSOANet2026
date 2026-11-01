@@ -152,6 +152,34 @@ def test_mibminet_matches_paper():
         assert float_ops(q) == [], float_ops(q)
 
 
+def test_shallowconvnet_matches_registration():
+    """The registered ShallowConvNet: 40 temporal filters of 25 samples, 40 spatial filters, square,
+    mean-pool 75 stride 15, log, dropout 0.5, no weight constraints."""
+    from deploy.train_physionet_mi import VARIANTS, constrain
+    from eeg_project.scripts.models.convnets import ShallowConvNet
+    for ch, t in [(62, 1000), (64, 750)]:
+        m = VARIANTS["shallow"](ch, t, 2, 250.0, 0.25)
+        assert isinstance(m, ShallowConvNet)
+        assert m.temporal.out_channels == 40 and m.temporal.kernel_size == (1, 25)
+        assert m.spatial.out_channels == 40 and m.spatial.kernel_size == (ch, 1)
+        assert m.pool.kernel_size == (1, 75) and m.pool.stride == (1, 15)
+        assert isinstance(m.pool, nn.AvgPool2d)
+        drops = [mod.p for mod in m.classifier.modules() if isinstance(mod, nn.Dropout)]
+        assert drops == [0.5]
+        n_out = (t - 25 + 1 - 75) // 15 + 1
+        assert m.classifier[2].in_features == 40 * n_out
+        x = torch.randn(3, 1, ch, t)
+        with torch.no_grad():                         # square -> pool -> log, by hand
+            h = m.bn.eval()(m.spatial(m.temporal(x))) ** 2
+            ref = m.classifier.eval()(torch.log(torch.clamp(m.pool(h), min=1e-6)))
+            assert torch.allclose(m.eval()(x), ref, atol=1e-5)
+        with torch.no_grad():
+            m.spatial.weight.mul_(100)
+        before = m.spatial.weight.clone()
+        constrain(m)                                  # no max-norm
+        assert torch.equal(before, m.spatial.weight)
+
+
 def test_cheaper_than_v1():
     for ch, t, nc in [(64, 640, 4), (62, 2000, 2)]:
         x = torch.randn(1, 1, ch, t)
