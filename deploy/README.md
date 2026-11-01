@@ -124,3 +124,23 @@ Two things to keep in mind when reading its output:
 activations). ST documents import of QDQ quantized ONNX in X-CUBE-AI
 (https://wiki.st.com/stm32mcu/wiki/AI:X-CUBE-AI_support_of_ONNX_and_TensorFlow_quantized_models).
 That import, and conversion to TFLite Micro, have not been tested here.
+
+## Preregistered study (OSF 8st47)
+
+"Is a shared training recipe neutral?"  The code that implements the registration:
+
+| File | Contents |
+|---|---|
+| `prereg_data.py` | Lee2019-MI / Cho2017 loaders (**locked**), registered preprocessing, splits, exclusion table |
+| `prereg_recipes.py` | Recipes R1-R4, condition T's search space, training loop |
+| `prereg_run.py` | Runs a cell (F1a, F1b, F2): exclusions, T tuning, every arch × recipe × fold/subject × seed, int8, profiles |
+| `prereg_analysis.py` | H1, H2, H2b (Holm), H3, H4, and the sensitivity analyses |
+| `test_prereg.py` | Tests, on synthetic stand-ins only |
+| `PREREG_DECISIONS.md` | Clarifications of the registration, for the freeze amendment |
+
+The confirmatory datasets refuse to load unless `CSOANET_CONFIRMATORY_UNLOCK=1`, which only Yu sets
+after the code is frozen at a git tag.  Before that, use the stand-ins:
+
+    python deploy/prereg_run.py --cell F1a --synthetic --epochs 2 --seeds 0 --t-configs 2
+    python deploy/prereg_analysis.py deploy/prereg_results/F1a_synthetic_per_subject.csv
+    python deploy/test_prereg.py
