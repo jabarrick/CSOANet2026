@@ -499,6 +499,100 @@ def test_runner_refuses_real_cells_and_overrides():
             pass
 
 
+# ----------------------------------------------------------------------------- item 5: analysis
+from deploy import prereg_analysis as pa  # noqa: E402
+
+
+def synthetic_results(recipe_eff=None, inter=None, n=(30, 28, 30), seed=0, t_eff=None):
+    """Per-subject per-seed rows like prereg_run.py writes, with planted effects (accuracy scale)."""
+    import pandas as pd
+    rng = np.random.default_rng(seed)
+    recipe_eff = recipe_eff or {}
+    inter = inter or {}
+    t_eff = t_eff or {}
+    arch_eff = dict(eegnet=0.0, shallow=0.01, mibminet=-0.01, csoanet=0.005)
+    rows = []
+    for cell, ds, n_sub in zip(("F1a", "F1b", "F2"), ("Lee2019_MI", "Cho2017", "Lee2019_MI"), n):
+        for s in range(1, n_sub + 1):
+            u = rng.normal(0, 0.06) + (0.03 if ds == "Cho2017" else 0)
+            for arch in pa.ARCHS:
+                for rec in pa.RECIPES + ("T",):
+                    mu = 0.7 + u + arch_eff[arch] + recipe_eff.get(rec, 0) + inter.get((arch, rec), 0)
+                    mu += t_eff.get(arch, 0) if rec == "T" else 0
+                    for seed_ in (0, 1, 2):
+                        a = float(np.clip(mu + rng.normal(0, 0.02), 0, 1))
+                        rows.append(dict(cell=cell, dataset=ds, arch=arch, recipe=rec, subject=s, seed=seed_,
+                                         fold=0, bacc_fp32=a, bacc_int8=float(np.clip(a - 0.01 + rng.normal(0, 0.005), 0, 1))))
+    return pd.DataFrame(rows)
+
+
+def test_analysis_detects_planted_effects():
+    null = synthetic_results()
+    rec = synthetic_results(recipe_eff=dict(R2=0.04, R3=-0.03))
+    h2b = synthetic_results(inter={("eegnet", "R2"): 0.05, ("csoanet", "R2"): -0.05})
+    for name, df, h1_sig, h2_sig, h2b_sup in (("null", null, False, False, False), ("recipe", rec, True, False, False),
+                                               ("h2b", h2b, False, True, True)):
+        report, tables = pa.analyse(df)
+        for fam in ("F1", "F2"):
+            r = report[fam]
+            assert r["H1"]["df"] == 3 and r["H2"]["df"] == 9, r
+            assert r["H1"]["significant"] == h1_sig, (name, fam, r["H1"])
+            assert r["H2"]["significant"] == h2_sig, (name, fam, r["H2"])
+            assert r["H2b"]["supported"] == h2b_sup, (name, fam, r["H2b"])
+            assert r["n_subjects"] == (58 if fam == "F1" else 30)
+            assert set(r["sensitivity"]) >= {"int8", "ART"} | ({"F1a", "F1b"} if fam == "F1" else set())
+            assert 0 <= r["sensitivity"]["ART"]["H1"]["p"] <= 1
+            if name == "recipe":
+                assert r["sensitivity"]["ART"]["H1"]["p"] < 1e-6 and r["sensitivity"]["int8"]["H1"]["significant"]
+            if name == "h2b":
+                assert abs(r["H2b"]["mean_c"] - 0.10) < 0.02 and r["sensitivity"]["ART"]["H2"]["p"] < 1e-6
+            assert len(tables[fam]["H3"]) == 24 and len(tables[fam]["H4"]) == 6
+    # opposite sign: significant but negative c is not support
+    neg = synthetic_results(inter={("eegnet", "R2"): -0.05, ("csoanet", "R2"): 0.05})
+    r = pa.analyse(neg)[0]["F2"]["H2b"]
+    assert r["significant"] and r["mean_c"] < 0 and not r["supported"]
+
+
+def test_holm_and_categories():
+    adj, rej = pa.holm([0.01, 0.04, 0.03])
+    assert np.allclose(adj, [0.03, 0.06, 0.06]) and rej.tolist() == [True, False, False]
+    adj, rej = pa.holm([0.001, 0.02, 0.04])
+    assert np.allclose(adj, [0.003, 0.04, 0.04]) and rej.all()
+    assert pa.category(0.005, 0.015) == "equivalent"          # above 0 and inside +-2: equivalent wins
+    assert pa.category(-0.019, 0.019) == "equivalent"
+    assert pa.category(0.01, 0.05) == "A better"
+    assert pa.category(-0.05, -0.03) == "B better"
+    assert pa.category(-0.01, 0.03) == "inconclusive"
+    assert pa.category(-0.02, 0.01) == "inconclusive"          # strictly inside
+    assert abs(pa.CI_LEVEL - (1 - 0.05 / 24)) < 1e-12 and f"{pa.CI_LEVEL:.4%}" == "99.7917%"
+    rng = np.random.default_rng(1)
+    d = rng.normal(0.01, 0.03, 40)
+    ci = pa.paired_ci(d)
+    lo, hi = stats_t_interval(d, pa.CI_LEVEL)
+    assert np.isclose(ci["lo"], lo) and np.isclose(ci["hi"], hi)
+
+
+def stats_t_interval(d, level):
+    from scipy import stats
+    return stats.t.interval(level, len(d) - 1, loc=np.mean(d), scale=stats.sem(d))
+
+
+def test_h4_and_outputs():
+    df = synthetic_results(t_eff=dict(csoanet=0.06))
+    with tempfile.TemporaryDirectory() as out:
+        report, tables = pa.analyse(df, out)
+        files = {p.name for p in Path(out).iterdir()}
+        assert {"analysis.json", "F1_H3.csv", "F1_H4.csv", "F2_H3.csv", "F1_H3_int8.csv", "F1_H3_F1a.csv"} <= files
+    h4 = tables["F2"]["H4"]
+    assert set(h4.recipe) == {"T"} and (h4.level == pa.CI_LEVEL).all()
+    row = h4[(h4.A == "eegnet") & (h4.B == "csoanet")].iloc[0]
+    assert row.category == "B better"
+    tau = report["F2"]["H4_tau"]
+    assert -1 <= tau["tau"] <= 1 and tau["mean_T"]["csoanet"] > tau["mean_R1"]["csoanet"]
+    same = synthetic_results(n=(10, 10, 10))
+    assert pa.analyse(same)[0]["F2"]["H4_tau"]["tau"] > 0
+
+
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")

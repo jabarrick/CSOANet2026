@@ -5,4 +5,5 @@ scipy>=1.10
 mne>=1.8.0
 onnx>=1.15
 onnxruntime>=1.17
-moabb>=1.0      # only for --dataset bci2a
+moabb==1.7.2    # registered version; --dataset bci2a and the preregistered study
+statsmodels>=0.14   # prereg_analysis.py (ML mixed models)
